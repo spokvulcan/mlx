@@ -402,7 +402,18 @@ bool Device::command_buffer_needs_commit(int index) {
 MTL::CommandBuffer* Device::get_command_buffer(int index) {
   auto& stream = get_stream_(index);
   if (stream.buffer == nullptr) {
-    stream.buffer = stream.queue->commandBufferWithUnretainedReferences();
+    // Use retained references so Metal keeps every referenced MTLBuffer alive
+    // until this command buffer completes. With unretained references the
+    // allocator's buffer cache can deallocate a buffer that an in-flight
+    // command buffer still references: when malloc() finds the cache over its
+    // limit it calls buffer_cache_.release_cached_buffers(), whose callback
+    // runs buf->release() on a cached buffer whose producing/consuming command
+    // buffer has not yet completed. With ResourceHazardTrackingModeUntracked
+    // buffers that frees the underlying allocation out from under the GPU,
+    // which fails completion with kIOGPUCommandBufferCallbackErrorInvalidResource.
+    // Retained references let Metal hold the buffer until the command buffer
+    // finishes, so release() from the cache trim only drops MLX's own ref.
+    stream.buffer = stream.queue->commandBuffer();
     if (!stream.buffer) {
       throw std::runtime_error(
           "[metal::Device] Unable to create new command buffer");
