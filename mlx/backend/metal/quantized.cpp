@@ -1369,9 +1369,19 @@ void gather_qmm_rhs(
   array w = ensure_row_contiguous(w_, d, s);
   array scales = ensure_row_contiguous(scales_, d, s);
 
-  // TODO: Tune the block sizes
+  // Rows-per-expert-aware tile geometry. With sorted rhs indices, a tile
+  // that fits inside one expert's run does a single K-loop; below 32 rows
+  // per expert the 16-row tile is the one that stays run-aligned. Once
+  // runs reach 32 rows, a wider 32x64 tile is outright faster (measured
+  // +12-14% at rows-per-expert 32 on the Qwen3.6-35B-A3B shapes, more
+  // above; it straddles runs below 32 and loses heavily there).
   int bm = 16, bn = 32, bk = 32;
   int wm = 1, wn = 2;
+  const int E = w_.size() / w_.shape(-1) / w_.shape(-2);
+  if (E > 0 && M / E >= 32) {
+    bm = 32;
+    bn = 64;
+  }
 
   const bool align_M = (M % bm) == 0;
   const bool align_N = (N % bn) == 0;
