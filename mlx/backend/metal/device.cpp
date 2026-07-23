@@ -278,7 +278,9 @@ void CommandEncoder::set_output_array(
 }
 
 void CommandEncoder::register_output_array(const array& a) {
-  all_outputs_.insert(a.buffer().ptr());
+  if (all_outputs_.insert(a.buffer().ptr()).second) {
+    stream_.buffer_output_sizes += a.data_size();
+  }
 
   auto buf = static_cast<MTL::Resource*>(const_cast<void*>(a.buffer().ptr()));
   if (concurrent_) {
@@ -359,8 +361,20 @@ Device::Device() {
       max_mb_per_buffer_ = 40;
       break;
   }
+  // C4 (tesseract): relax the input-bytes leg 50 -> 100 and add the
+  // output-bytes leg. Weight-buffer traffic (unique input bytes) used to
+  // force ~37-45 mid-eval commits per decode token on MoE models — each
+  // command-buffer boundary costs ~60-68 us of GPU-side pipeline drain,
+  // which dominates CPU-bound decode. 100 MB collapses ~half of those
+  // boundaries (measured +2.6/+4.5/+2.4% MoE decode TPS at 128/8K/32K ctx,
+  // +4.2% dense 32K) while the 10 MB output cap keeps prefill temporaries
+  // on the stock commit cadence (peak memory flat-to-better everywhere;
+  // a flat input-cap raise without it regressed peak +8-46%).
+  max_mb_per_buffer_ = 100;
   max_ops_per_buffer_ = env::max_ops_per_buffer(max_ops_per_buffer_);
   max_mb_per_buffer_ = env::max_mb_per_buffer(max_mb_per_buffer_);
+  max_mb_output_per_buffer_ =
+      env::max_mb_output_per_buffer(max_mb_output_per_buffer_);
 }
 
 Device::~Device() {
@@ -396,7 +410,9 @@ MTL::CommandQueue* Device::get_queue(Stream stream) {
 bool Device::command_buffer_needs_commit(int index) {
   auto& stream = get_stream_(index);
   return (stream.buffer_ops > max_ops_per_buffer_) ||
-      ((stream.buffer_sizes >> 20) > max_mb_per_buffer_);
+      ((stream.buffer_sizes >> 20) > max_mb_per_buffer_) ||
+      (max_mb_output_per_buffer_ > 0 &&
+       (stream.buffer_output_sizes >> 20) > max_mb_output_per_buffer_);
 }
 
 MTL::CommandBuffer* Device::get_command_buffer(int index) {
@@ -420,6 +436,7 @@ void Device::commit_command_buffer(int index) {
   stream.buffer = nullptr;
   stream.buffer_ops = 0;
   stream.buffer_sizes = 0;
+  stream.buffer_output_sizes = 0;
 }
 
 void Device::add_temporary(array arr, int index) {

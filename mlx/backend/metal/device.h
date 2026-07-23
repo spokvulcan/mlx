@@ -138,6 +138,9 @@ struct DeviceStream {
   MTL::CommandBuffer* buffer{nullptr};
   int buffer_ops{0};
   size_t buffer_sizes{0};
+  // Unique output (temporary) bytes of the active encoder — the commit
+  // accounting leg that bounds temporaries in flight.
+  size_t buffer_output_sizes{0};
 
   // The command encoder, fence, and temporaries are updated between command
   // encoders
@@ -259,6 +262,7 @@ class MLX_API Device {
   int arch_gen_;
   int max_ops_per_buffer_;
   int max_mb_per_buffer_;
+  int max_mb_output_per_buffer_{10};
 };
 
 MLX_API Device& device(mlx::core::Device);
