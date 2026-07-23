@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <cstdio>
 #include <cstdlib>
 #include <sstream>
 
@@ -429,8 +430,34 @@ MTL::CommandBuffer* Device::get_command_buffer(int index) {
   return stream.buffer;
 }
 
+void Device::retain_until_commit(
+    int index,
+    std::shared_ptr<array::Data> ptr) {
+  get_stream_(index).pending_retained.push_back(std::move(ptr));
+}
+
 void Device::commit_command_buffer(int index) {
   auto& stream = get_stream_(index);
+  if (!stream.pending_retained.empty()) {
+    // One retention handler per command buffer instead of one per op.
+    // No dedup: duplicate refs are released together by this same handler,
+    // so object lifetimes are unchanged — sorting would cost more than it
+    // saves (measured: the per-commit sort ate the win on commit-dense
+    // dense-model decode). The handler attaches to the same command
+    // buffer the ops were encoded in, so release timing is identical to
+    // the per-op handlers.
+    auto& v = stream.pending_retained;
+    stream.buffer->addCompletedHandler(
+        [buffers = std::move(v)](MTL::CommandBuffer* cbuf) {
+          if (cbuf->status() == MTL::CommandBufferStatusError) {
+            fprintf(
+                stderr,
+                "[METAL] Command buffer execution failed: %s\n",
+                cbuf->error()->localizedDescription()->utf8String());
+          }
+        });
+    v.clear();
+  }
   stream.buffer->commit();
   stream.buffer->release();
   stream.buffer = nullptr;

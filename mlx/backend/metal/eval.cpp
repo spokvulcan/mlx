@@ -42,33 +42,34 @@ void eval(array& arr) {
     debug_set_primitive_buffer_label(command_buffer, arr.primitive());
     arr.primitive().eval_gpu(arr.inputs(), outputs);
   }
-  std::unordered_set<std::shared_ptr<array::Data>> buffers;
+  // Retain this op's input buffers until the active command buffer
+  // completes (flushed as a single handler at commit; buffers an
+  // input donated to the output are held by the output array itself and
+  // are not retained here — same lifetime semantics as the old set).
+  auto out_data = arr.data_shared_ptr();
   for (auto& in : arr.inputs()) {
-    buffers.insert(in.data_shared_ptr());
+    auto p = in.data_shared_ptr();
+    if (p != out_data) {
+      d.retain_until_commit(s.index, std::move(p));
+    }
   }
-  for (auto& s : arr.siblings()) {
-    buffers.insert(s.data_shared_ptr());
-  }
-  // Remove the output if it was donated to by an input
-  if (auto it = buffers.find(arr.data_shared_ptr()); it != buffers.end()) {
-    buffers.erase(it);
+  for (auto& sb : arr.siblings()) {
+    auto p = sb.data_shared_ptr();
+    if (p != out_data) {
+      d.retain_until_commit(s.index, std::move(p));
+    }
   }
 
   if (d.command_buffer_needs_commit(s.index)) {
     d.end_encoding(s.index);
     scheduler::notify_new_task(s);
     command_buffer->addCompletedHandler(
-        [s, buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
+        [s](MTL::CommandBuffer* cbuf) {
           scheduler::notify_task_completion(s);
           check_error(cbuf);
         });
     d.commit_command_buffer(s.index);
     d.get_command_buffer(s.index);
-  } else {
-    command_buffer->addCompletedHandler(
-        [buffers = std::move(buffers)](MTL::CommandBuffer* cbuf) {
-          check_error(cbuf);
-        });
   }
 }
 

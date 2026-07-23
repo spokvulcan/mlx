@@ -138,6 +138,12 @@ struct DeviceStream {
   MTL::CommandBuffer* buffer{nullptr};
   int buffer_ops{0};
   size_t buffer_sizes{0};
+  // Input buffers of ops encoded in the active command buffer, retained
+  // until that buffer completes (flushed as one completion handler at
+  // commit — replaces the per-op handler that used to be attached in
+  // gpu::eval). Release timing is unchanged: the flush attaches to the
+  // same command buffer the ops were encoded in.
+  std::vector<std::shared_ptr<array::Data>> pending_retained;
   // Unique output (temporary) bytes of the active encoder — the commit
   // accounting leg that bounds temporaries in flight.
   size_t buffer_output_sizes{0};
@@ -175,6 +181,7 @@ class MLX_API Device {
   MTL::CommandBuffer* get_command_buffer(int index);
   bool command_buffer_needs_commit(int index);
   void commit_command_buffer(int index);
+  void retain_until_commit(int index, std::shared_ptr<array::Data> ptr);
   CommandEncoder& get_command_encoder(int index);
   void end_encoding(int index);
 
