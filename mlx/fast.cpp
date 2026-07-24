@@ -1,7 +1,9 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <cassert>
+#include <limits>
 #include <numeric>
 
+#include "mlx/backend/metal/metal.h"
 #include "mlx/fast.h"
 #include "mlx/fast_primitives.h"
 #include "mlx/ops.h"
@@ -130,10 +132,14 @@ for (int r = 0; r < static_cast<int>(ceildiv(axis_size, N_READS * lsize));
 )MLX";
 
 CustomKernelFunction fused_causal_softmax() {
+  // The output MUST be named "y": the kernel body aliases it
+  // (`device bfloat16_t* out = y;`) and the body has to stay byte-identical
+  // to the probe-proven text — rename here and the generated source stops
+  // compiling (the alias's rhs goes undefined).
   static auto fn = metal_kernel(
       "sdpa_causal_softmax",
       {"scores", "params"},
-      {"out"},
+      {"y"},
       fused_causal_softmax_source,
       fused_causal_softmax_header);
   return fn;
@@ -865,12 +871,22 @@ array scaled_dot_product_attention(
     // C13 (tesseract, M5): causal bool-mask fallback chains with a long
     // enough axis take the fused kernel; the masked-scores round trip and
     // the bool-mask materialization are pure waste otherwise. Restricted
-    // to the exact case the kernel is proven bitwise for (bf16, causal,
-    // no array mask, no sinks, looped-softmax sizes, contiguous matmul
-    // output); everything else keeps the stock chain.
+    // to the exact case the kernel is proven bitwise for: bf16, causal, no
+    // array mask, no sinks, kL > 4096 (the stock chain dispatches
+    // softmax_looped there, whose body the kernel replicates verbatim at
+    // lsize 1024). Layout is not assumed — the CustomKernel primitive
+    // copies any non-row-contiguous input before dispatch
+    // (ensure_row_contiguous). Function-transform traces (grad/vmap/
+    // compile) keep the stock chain: CustomKernel defines no vjp/jvp/vmap
+    // while the stock chain differentiates. Non-Metal devices and builds
+    // keep the stock chain too, and rows are bounded so the dispatch grid
+    // stays inside int32.
     if (do_causal && !has_arr_mask && !has_sinks &&
         scores.dtype() == bfloat16 && scores.shape(-1) > 4096 &&
-        scores.flags().row_contiguous) {
+        to_stream(s).device == Device::gpu && metal::is_available() &&
+        !mlx::core::detail::InTracing::in_tracing() &&
+        scores.size() / scores.shape(-1) <=
+            static_cast<size_t>(std::numeric_limits<int>::max() / 1024)) {
       const int kL = scores.shape(-1);
       const int qL = q.shape(-2);
       array params({kL, kL - qL, qL}, {3}, int32);
@@ -887,55 +903,59 @@ array scaled_dot_product_attention(
           s)[0];
     } else {
       if (has_arr_mask || do_causal) {
-      // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
-      auto make_or_fetch_mask = [&]() {
-        if (do_causal) {
-          int kL = k.shape(-2);
-          int qL = q.shape(-2);
-          int offset = kL - qL;
-          auto q_idx = arange(offset, qL + offset, s);
-          auto k_idx = arange(0, kL, s);
-          q_idx = expand_dims(q_idx, 1, s);
-          k_idx = expand_dims(k_idx, 0, s);
-          return greater_equal(q_idx, k_idx, s);
-        }
-        return inputs[3];
-      };
-      auto mask = make_or_fetch_mask();
+        // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
+        auto make_or_fetch_mask = [&]() {
+          if (do_causal) {
+            int kL = k.shape(-2);
+            int qL = q.shape(-2);
+            int offset = kL - qL;
+            auto q_idx = arange(offset, qL + offset, s);
+            auto k_idx = arange(0, kL, s);
+            q_idx = expand_dims(q_idx, 1, s);
+            k_idx = expand_dims(k_idx, 0, s);
+            return greater_equal(q_idx, k_idx, s);
+          }
+          return inputs[3];
+        };
+        auto mask = make_or_fetch_mask();
 
-      if (n_repeats > 1 && mask.ndim() >= 3) {
-        if (mask.shape(-3) == 1) {
-          mask = expand_dims(mask, -3, s);
+        if (n_repeats > 1 && mask.ndim() >= 3) {
+          if (mask.shape(-3) == 1) {
+            mask = expand_dims(mask, -3, s);
+          } else {
+            mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+          }
+        }
+        if (mask.dtype() == bool_) {
+          scores = where(
+              mask,
+              scores,
+              array(finfo(scores.dtype()).min, scores.dtype()),
+              s);
         } else {
-          mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+          scores = add(scores, mask, s);
         }
       }
-      if (mask.dtype() == bool_) {
-        scores = where(
-            mask, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
-      } else {
-        scores = add(scores, mask, s);
+      if (has_sinks) {
+        auto sinks = inputs.back();
+        // scores has shape B N_q N_k L_q L_k
+        sinks = expand_dims(sinks, {0, 2, 3}, s);
+        if (scores.ndim() == 5) {
+          sinks = unflatten(sinks, 1, {n_kv_heads, n_repeats}, s);
+        }
+        auto bsx_shape = scores.shape();
+        bsx_shape.back() = 1;
+        scores =
+            concatenate({broadcast_to(sinks, bsx_shape, s), scores}, -1, s);
       }
-    }
-    if (has_sinks) {
-      auto sinks = inputs.back();
-      // scores has shape B N_q N_k L_q L_k
-      sinks = expand_dims(sinks, {0, 2, 3}, s);
-      if (scores.ndim() == 5) {
-        sinks = unflatten(sinks, 1, {n_kv_heads, n_repeats}, s);
+      scores = softmax(scores, std::vector<int>{-1}, true, s);
+      if (has_sinks) {
+        // Slice off scores
+        auto start = Shape(scores.ndim(), 0);
+        start.back() = 1;
+        auto stop = scores.shape();
+        scores = slice(scores, std::move(start), std::move(stop), s);
       }
-      auto bsx_shape = scores.shape();
-      bsx_shape.back() = 1;
-      scores = concatenate({broadcast_to(sinks, bsx_shape, s), scores}, -1, s);
-    }
-    scores = softmax(scores, std::vector<int>{-1}, true, s);
-    if (has_sinks) {
-      // Slice off scores
-      auto start = Shape(scores.ndim(), 0);
-      start.back() = 1;
-      auto stop = scores.shape();
-      scores = slice(scores, std::move(start), std::move(stop), s);
-    }
     }
     auto out = matmul(scores, v, s);
     if (n_repeats > 1) {
