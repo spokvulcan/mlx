@@ -5,11 +5,11 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <unordered_map>
 #include <mutex>
 #include <numeric>
 #include <set>
 #include <sstream>
-#include <unordered_map>
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
@@ -75,35 +75,46 @@ array indices_or_default(
   // C9 (tesseract): the identity row indices are constant per shape, but
   // MoE decode was rebuilding them — one Arange kernel dispatch plus a
   // Reshape node per gather, three gathers per expert layer per token.
-  // Cache the array once evaluated: later graphs see an already-evaluated
-  // constant leaf, and all consumers treat indices as read-only.
-  static std::mutex cache_mtx;
-  static std::unordered_map<uint64_t, array> cache;
-  // Key: FNV-1a over total + shape dims — no string building on the hit
-  // path (this runs three times per expert layer per decode token).
-  uint64_t key = 1469598103934665603ull;
-  auto mix = [&key](uint64_t v) {
-    key = (key ^ v) * 1099511628211ull;
-  };
-  mix(static_cast<uint64_t>(total));
-  mix(static_cast<uint64_t>(shape.size()));
-  for (auto d : shape) {
-    mix(static_cast<uint64_t>(d));
+  // The cache publishes only *evaluated* arrays, so every consumer sees an
+  // immutable constant leaf: no pending node is ever shared across threads
+  // or streams, and donation is impossible (the cache's reference keeps
+  // use_count > 1). Keys are exact shapes — a bare 64-bit hash could, with
+  // vanishing probability, alias two shapes and silently return wrong
+  // indices. Function-transform traces bypass the cache: inside a trace
+  // the indices are baked as trace constants anyway, and evaluating here
+  // would interleave an eval with the trace.
+  if (detail::InTracing::in_tracing()) {
+    return reshape(arange(total, uint32, s), std::move(shape), s);
   }
+  // FNV-1a positions the bucket; Shape's exact operator== decides identity.
+  struct ShapeKeyHash {
+    size_t operator()(const Shape& key_shape) const {
+      uint64_t key = 1469598103934665603ull;
+      key = (key ^ static_cast<uint64_t>(key_shape.size())) *
+          1099511628211ull;
+      for (auto d : key_shape) {
+        key = (key ^ static_cast<uint64_t>(d)) * 1099511628211ull;
+      }
+      return static_cast<size_t>(key);
+    }
+  };
+  static std::mutex cache_mtx;
+  static std::unordered_map<Shape, array, ShapeKeyHash> cache;
   {
     std::lock_guard<std::mutex> lock(cache_mtx);
-    if (auto it = cache.find(key); it != cache.end()) {
+    if (auto it = cache.find(shape); it != cache.end()) {
       return it->second;
     }
   }
-  auto built = reshape(arange(total, uint32, s), std::move(shape), s);
+  auto built = reshape(arange(total, uint32, s), Shape(shape), s);
+  eval(built);
   std::lock_guard<std::mutex> lock(cache_mtx);
   if (cache.size() >= 64) {
     // Bounded cache: in-flight graphs hold their own references, so
     // dropping ours is always safe.
     cache.clear();
   }
-  return cache.emplace(key, std::move(built)).first->second;
+  return cache.emplace(std::move(shape), std::move(built)).first->second;
 }
 
 void validate_quantized_input(
