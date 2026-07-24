@@ -378,6 +378,38 @@ Device::Device() {
       env::max_mb_output_per_buffer(max_mb_output_per_buffer_);
 }
 
+void Device::set_commit_limits(
+    int max_mb_per_buffer,
+    int max_mb_output_per_buffer,
+    int max_ops_per_buffer) {
+  if (max_mb_per_buffer > 0) {
+    max_mb_per_buffer_ = max_mb_per_buffer;
+  }
+  if (max_mb_output_per_buffer > 0) {
+    max_mb_output_per_buffer_ = max_mb_output_per_buffer;
+  }
+  if (max_ops_per_buffer > 0) {
+    max_ops_per_buffer_ = max_ops_per_buffer;
+  }
+}
+
+void set_commit_limits(
+    int max_mb_per_buffer,
+    int max_mb_output_per_buffer,
+    int max_ops_per_buffer) {
+  device(mlx::core::Device{mlx::core::Device::gpu, 0})
+      .set_commit_limits(
+          max_mb_per_buffer, max_mb_output_per_buffer, max_ops_per_buffer);
+}
+
+extern "C" void mlx_metal_set_commit_limits(
+    int32_t max_mb_per_buffer,
+    int32_t max_mb_output_per_buffer,
+    int32_t max_ops_per_buffer) {
+  mlx::core::metal::set_commit_limits(
+      max_mb_per_buffer, max_mb_output_per_buffer, max_ops_per_buffer);
+}
+
 Device::~Device() {
   auto pool = new_scoped_memory_pool();
   for (auto& [l, kernel_map] : library_kernels_) {

@@ -3,6 +3,7 @@
 #pragma once
 
 #include <Metal/Metal.hpp>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <shared_mutex>
@@ -176,6 +177,12 @@ class MLX_API Device {
 
   void new_queue(int index);
 
+  // C7 (tesseract): runtime commit-policy override, see below.
+  void set_commit_limits(
+      int max_mb_per_buffer,
+      int max_mb_output_per_buffer,
+      int max_ops_per_buffer);
+
   MTL::CommandQueue* get_queue(Stream stream);
 
   MTL::CommandBuffer* get_command_buffer(int index);
@@ -265,12 +272,27 @@ class MLX_API Device {
       std::unordered_map<std::string, MTL::ComputePipelineState*>>
       library_kernels_;
   const MTL::ResidencySet* residency_set_{nullptr};
+
+ private:
   std::string arch_;
   int arch_gen_;
-  int max_ops_per_buffer_;
-  int max_mb_per_buffer_;
-  int max_mb_output_per_buffer_{10};
+  std::atomic<int> max_ops_per_buffer_;
+  std::atomic<int> max_mb_per_buffer_;
+  std::atomic<int> max_mb_output_per_buffer_{10};
 };
+
+// C7 (tesseract): runtime commit-policy override on the GPU device. The
+// decode regimes that matter (MoE boundary-limited vs dense
+// starvation-limited) are indistinguishable from the GPU side (C4/v4
+// probe) but known to the app, which selects the model — so the app opts
+// MoE loads into the relaxed input cap. A value of 0 leaves that leg
+// unchanged. Call around model load, not during in-flight eval. Commit
+// points are scheduling boundaries only; results are commit-point
+// invariant (C4 parity gates).
+MLX_API void set_commit_limits(
+    int max_mb_per_buffer,
+    int max_mb_output_per_buffer,
+    int max_ops_per_buffer);
 
 MLX_API Device& device(mlx::core::Device);
 
