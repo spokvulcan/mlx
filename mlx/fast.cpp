@@ -10,6 +10,137 @@
 
 namespace mlx::core::fast {
 
+namespace {
+
+// C13 (tesseract, M5): fused causal-mask + softmax for the SDPA ops
+// fallback. The unfused chain (greater_equal -> where(bf16 finfo.min) ->
+// softmax precise) moves ~3x the scores traffic (mask build + masked-scores
+// round trip ≈ 5% of 32K prefill measured); this kernel lands on the
+// softmax traffic floor. Bitwise contract, proven in the /tmp/gather-sweep
+// probe (14/14 configs IDENT): this is the verbatim `softmax_looped`
+// (precise, N_READS=4) body with the causal select injected at both load
+// sites. The masked value never reaches the output arithmetic: it is the
+// exact bf16 finfo.min as f32, and exp(min - max) underflows to exactly 0
+// in f32 (every row has >= 1 valid causal element since offset = kL - qL
+// >= 0). The threadgroup size MUST equal the production softmax dispatch
+// (maxTotalThreadsPerThreadgroup = 1024 on this class of GPU) — the f32
+// accumulation order depends on lsize.
+const char* fused_causal_softmax_header = R"MLX(
+constant constexpr float BF16_MINF = -0x1.FEp+127f;
+template <typename T>
+inline T softmax_exp(T x) {
+  return fast::exp(x);
+}
+)MLX";
+
+const char* fused_causal_softmax_source = R"MLX(
+const int axis_size = params[0];
+const int cofs = params[1];
+const int qL = params[2];
+
+uint gid = threadgroup_position_in_grid.x;
+uint lid = thread_position_in_threadgroup.x;
+uint lsize = threads_per_threadgroup.x;
+uint simd_lane_id = thread_index_in_simdgroup;
+uint simd_group_id = simdgroup_index_in_threadgroup;
+
+const device bfloat16_t* in = scores;
+device bfloat16_t* out = y;
+in += gid * size_t(axis_size);
+const int rowlim = cofs + int(gid) % qL;
+
+constexpr int SIMD_SIZE = 32;
+constexpr int N_READS = 4;
+
+threadgroup float local_max[SIMD_SIZE];
+threadgroup float local_normalizer[SIMD_SIZE];
+
+float prevmax;
+float maxval = Limits<float>::finite_min;
+float normalizer = 0;
+for (int r = 0; r < static_cast<int>(ceildiv(axis_size, N_READS * lsize));
+     r++) {
+  int offset = r * lsize * N_READS + lid * N_READS;
+  float vals[N_READS];
+  if (offset + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      vals[i] =
+          (offset + i <= rowlim) ? float(in[offset + i]) : BF16_MINF;
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      vals[i] =
+          (offset + i < axis_size)
+          ? ((offset + i <= rowlim) ? float(in[offset + i]) : BF16_MINF)
+          : Limits<float>::min;
+    }
+  }
+  prevmax = maxval;
+  for (int i = 0; i < N_READS; i++) {
+    maxval = (maxval < vals[i]) ? vals[i] : maxval;
+  }
+  normalizer *= softmax_exp(prevmax - maxval);
+  for (int i = 0; i < N_READS; i++) {
+    normalizer += softmax_exp(vals[i] - maxval);
+  }
+}
+prevmax = maxval;
+maxval = simd_max(maxval);
+normalizer *= softmax_exp(prevmax - maxval);
+normalizer = simd_sum(normalizer);
+
+prevmax = maxval;
+if (simd_lane_id == 0) {
+  local_max[simd_group_id] = maxval;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+maxval = simd_max(local_max[simd_lane_id]);
+normalizer *= softmax_exp(prevmax - maxval);
+if (simd_lane_id == 0) {
+  local_normalizer[simd_group_id] = normalizer;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+normalizer = simd_sum(local_normalizer[simd_lane_id]);
+normalizer = 1 / normalizer;
+
+out += gid * size_t(axis_size);
+for (int r = 0; r < static_cast<int>(ceildiv(axis_size, N_READS * lsize));
+     r++) {
+  int offset = r * lsize * N_READS + lid * N_READS;
+  if (offset + N_READS <= axis_size) {
+    for (int i = 0; i < N_READS; i++) {
+      out[offset + i] = bfloat16_t(
+          softmax_exp(
+              ((offset + i <= rowlim) ? float(in[offset + i]) : BF16_MINF) -
+              maxval) *
+          normalizer);
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if (offset + i < axis_size) {
+        out[offset + i] = bfloat16_t(
+            softmax_exp(
+                ((offset + i <= rowlim) ? float(in[offset + i]) : BF16_MINF) -
+                maxval) *
+            normalizer);
+      }
+    }
+  }
+}
+)MLX";
+
+CustomKernelFunction fused_causal_softmax() {
+  static auto fn = metal_kernel(
+      "sdpa_causal_softmax",
+      {"scores", "params"},
+      {"out"},
+      fused_causal_softmax_source,
+      fused_causal_softmax_header);
+  return fn;
+}
+
+} // namespace
+
 std::vector<array> Custom::vjp(
     const std::vector<array>& primals,
     const std::vector<array>& cotangents,
@@ -731,7 +862,31 @@ array scaled_dot_product_attention(
       v = expand_dims(v, 2, s);
     }
     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
-    if (has_arr_mask || do_causal) {
+    // C13 (tesseract, M5): causal bool-mask fallback chains with a long
+    // enough axis take the fused kernel; the masked-scores round trip and
+    // the bool-mask materialization are pure waste otherwise. Restricted
+    // to the exact case the kernel is proven bitwise for (bf16, causal,
+    // no array mask, no sinks, looped-softmax sizes, contiguous matmul
+    // output); everything else keeps the stock chain.
+    if (do_causal && !has_arr_mask && !has_sinks &&
+        scores.dtype() == bfloat16 && scores.shape(-1) > 4096 &&
+        scores.flags().row_contiguous) {
+      const int kL = scores.shape(-1);
+      const int qL = q.shape(-2);
+      array params({kL, kL - qL, qL}, {3}, int32);
+      scores = fused_causal_softmax()(
+          {scores, params},
+          {scores.shape()},
+          {scores.dtype()},
+          std::make_tuple(
+              static_cast<int>(scores.size() / kL) * 1024, 1, 1),
+          std::make_tuple(1024, 1, 1),
+          {},
+          std::nullopt,
+          false,
+          s)[0];
+    } else {
+      if (has_arr_mask || do_causal) {
       // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
       auto make_or_fetch_mask = [&]() {
         if (do_causal) {
@@ -780,6 +935,7 @@ array scaled_dot_product_attention(
       start.back() = 1;
       auto stop = scores.shape();
       scores = slice(scores, std::move(start), std::move(stop), s);
+    }
     }
     auto out = matmul(scores, v, s);
     if (n_repeats > 1) {
