@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <sstream>
+#include <unordered_map>
 
 #include "mlx/backend/cuda/cuda.h"
 #include "mlx/backend/metal/metal.h"
@@ -69,7 +71,39 @@ array indices_or_default(
   Shape shape(x.shape().begin(), x.shape().end() - 2);
   int total =
       std::reduce(shape.begin(), shape.end(), 1, std::multiplies<int>());
-  return reshape(arange(total, uint32, s), std::move(shape), s);
+
+  // C9 (tesseract): the identity row indices are constant per shape, but
+  // MoE decode was rebuilding them — one Arange kernel dispatch plus a
+  // Reshape node per gather, three gathers per expert layer per token.
+  // Cache the array once evaluated: later graphs see an already-evaluated
+  // constant leaf, and all consumers treat indices as read-only.
+  static std::mutex cache_mtx;
+  static std::unordered_map<uint64_t, array> cache;
+  // Key: FNV-1a over total + shape dims — no string building on the hit
+  // path (this runs three times per expert layer per decode token).
+  uint64_t key = 1469598103934665603ull;
+  auto mix = [&key](uint64_t v) {
+    key = (key ^ v) * 1099511628211ull;
+  };
+  mix(static_cast<uint64_t>(total));
+  mix(static_cast<uint64_t>(shape.size()));
+  for (auto d : shape) {
+    mix(static_cast<uint64_t>(d));
+  }
+  {
+    std::lock_guard<std::mutex> lock(cache_mtx);
+    if (auto it = cache.find(key); it != cache.end()) {
+      return it->second;
+    }
+  }
+  auto built = reshape(arange(total, uint32, s), std::move(shape), s);
+  std::lock_guard<std::mutex> lock(cache_mtx);
+  if (cache.size() >= 64) {
+    // Bounded cache: in-flight graphs hold their own references, so
+    // dropping ours is always safe.
+    cache.clear();
+  }
+  return cache.emplace(key, std::move(built)).first->second;
 }
 
 void validate_quantized_input(
