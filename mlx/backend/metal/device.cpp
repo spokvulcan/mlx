@@ -340,6 +340,19 @@ Device::Device() {
   }
   arch_gen_ = ag_tens * 10 + ag_ones;
   auto arch = arch_.back();
+  // C4 (tesseract): relax the input leg (Mac-class chips only) and add the
+  // output leg. Weight-buffer traffic (unique input data) used to force
+  // ~37-45 mid-eval commits per decode token on MoE models — each
+  // command-buffer boundary costs ~60-68 us of GPU-side pipeline drain,
+  // which dominates CPU-bound decode. 100 collapses ~half of those
+  // boundaries (measured +2.6/+4.5/+2.4% MoE decode TPS at 128/8K/32K ctx,
+  // +4.2% dense 32K, on M3 Max) while the output cap of 10 keeps prefill
+  // temporaries on the stock commit cadence (peak memory flat-to-better
+  // everywhere; a flat input-cap raise without it regressed peak +8-46%).
+  // Phone-class keeps stock caps: never measured there, and both C2 and C4
+  // showed small-graph regimes regress under relaxed caps. Both legs count
+  // data_size() units (elements, not bytes) — the pre-existing convention
+  // of the input leg.
   switch (arch) {
     case 'p': // phone
       max_ops_per_buffer_ = 20;
@@ -347,31 +360,21 @@ Device::Device() {
       break;
     case 'g': // base, pro
       max_ops_per_buffer_ = 40;
-      max_mb_per_buffer_ = 40;
+      max_mb_per_buffer_ = 100;
       break;
     case 's': // max
       max_ops_per_buffer_ = 50;
-      max_mb_per_buffer_ = 50;
+      max_mb_per_buffer_ = 100;
       break;
     case 'd': // ultra
       max_ops_per_buffer_ = 50;
-      max_mb_per_buffer_ = 50;
+      max_mb_per_buffer_ = 100;
       break;
     default: // default to medium
       max_ops_per_buffer_ = 40;
       max_mb_per_buffer_ = 40;
       break;
   }
-  // C4 (tesseract): relax the input-bytes leg 50 -> 100 and add the
-  // output-bytes leg. Weight-buffer traffic (unique input bytes) used to
-  // force ~37-45 mid-eval commits per decode token on MoE models — each
-  // command-buffer boundary costs ~60-68 us of GPU-side pipeline drain,
-  // which dominates CPU-bound decode. 100 MB collapses ~half of those
-  // boundaries (measured +2.6/+4.5/+2.4% MoE decode TPS at 128/8K/32K ctx,
-  // +4.2% dense 32K) while the 10 MB output cap keeps prefill temporaries
-  // on the stock commit cadence (peak memory flat-to-better everywhere;
-  // a flat input-cap raise without it regressed peak +8-46%).
-  max_mb_per_buffer_ = 100;
   max_ops_per_buffer_ = env::max_ops_per_buffer(max_ops_per_buffer_);
   max_mb_per_buffer_ = env::max_mb_per_buffer(max_mb_per_buffer_);
   max_mb_output_per_buffer_ =
@@ -479,6 +482,7 @@ void Device::commit_command_buffer(int index) {
     // buffer the ops were encoded in, so release timing is identical to
     // the per-op handlers.
     auto& v = stream.pending_retained;
+    const auto retained_count = v.size();
     stream.buffer->addCompletedHandler(
         [buffers = std::move(v)](MTL::CommandBuffer* cbuf) {
           if (cbuf->status() == MTL::CommandBufferStatusError) {
@@ -488,7 +492,11 @@ void Device::commit_command_buffer(int index) {
                 cbuf->error()->localizedDescription()->utf8String());
           }
         });
+    // The move takes the capacity with it; one up-front reservation sized
+    // by this buffer's count replaces the growth reallocations the next
+    // buffer would otherwise repeat from zero.
     v.clear();
+    v.reserve(retained_count);
   }
   stream.buffer->commit();
   stream.buffer->release();

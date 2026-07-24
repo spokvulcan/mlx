@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <deque>
 #include <future>
-#include <limits>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -365,8 +364,9 @@ array eval_impl(std::vector<array> outputs, bool async) {
 
   std::unordered_set<int> open_streams;
   // Per-stream set/map lookups hoisted out of the per-node path — decode
-  // evaluates hundreds of nodes back-to-back on a single stream.
-  uint32_t last_stream_index = std::numeric_limits<uint32_t>::max();
+  // evaluates hundreds of nodes back-to-back on a single stream. Stream
+  // indices are non-negative, so -1 is a safe "no stream yet" sentinel.
+  int last_stream_index = -1;
   Event* cur_event = nullptr;
   while (!tape.empty()) {
     auto arr = std::move(tape.back());

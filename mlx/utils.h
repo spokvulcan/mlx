@@ -155,11 +155,13 @@ inline int max_mb_per_buffer(int default_value) {
   return max_mb_per_buffer_;
 }
 
-// Cap on unique *output* (temporary) bytes per command buffer. Distinct
-// from max_mb_per_buffer, which counts all unique bytes touched per
+// Cap on unique *output* (temporary) data per command buffer. Distinct
+// from max_mb_per_buffer, which counts all unique data touched per
 // encoder (dominated by persistent weight buffers on weight-heavy ops):
 // this one bounds temporaries in flight between commits — the quantity
-// that actually drives peak memory.
+// that actually drives peak memory. Like the input leg, the accounting is
+// in data_size() units (elements, not bytes) — "MB" is the pre-existing
+// upstream misnomer, kept for consistency with MLX_MAX_MB_PER_BUFFER.
 inline int max_mb_output_per_buffer(int default_value) {
   static int max_mb_output_per_buffer_ =
       get_var("MLX_MAX_MB_OUTPUT_PER_BUFFER", default_value);

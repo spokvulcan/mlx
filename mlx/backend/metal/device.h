@@ -145,8 +145,13 @@ struct DeviceStream {
   // gpu::eval). Release timing is unchanged: the flush attaches to the
   // same command buffer the ops were encoded in.
   std::vector<std::shared_ptr<array::Data>> pending_retained;
-  // Unique output (temporary) bytes of the active encoder — the commit
-  // accounting leg that bounds temporaries in flight.
+  // Output (mostly temporary) data accumulated since the last commit — the
+  // commit accounting leg that bounds temporaries in flight. Counted in
+  // data_size() units (elements, not bytes), matching the pre-existing
+  // buffer_sizes input-leg convention; uniqueness is per-encoder while the
+  // counter spans all encoders of the command buffer, so re-registered
+  // outputs across encoder rotations over-count (conservative: commits
+  // earlier, never later).
   size_t buffer_output_sizes{0};
 
   // The command encoder, fence, and temporaries are updated between command
@@ -272,8 +277,6 @@ class MLX_API Device {
       std::unordered_map<std::string, MTL::ComputePipelineState*>>
       library_kernels_;
   const MTL::ResidencySet* residency_set_{nullptr};
-
- private:
   std::string arch_;
   int arch_gen_;
   std::atomic<int> max_ops_per_buffer_;
