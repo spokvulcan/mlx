@@ -2717,19 +2717,51 @@ template <typename T, int group_size, int bits>
   const device T* arow = x + (size_t)am * K;
 
   const int kbeg = (int)sg * KPS;
+  // Software pipeline: the packed weights + scale/bias for iteration kk+64 are
+  // loaded into registers while the MMA chain for kk runs, hiding the
+  // streaming-load latency behind 8 MMAs instead of exposing it per barrier.
+  const int j = (int)(lane & 7); // n column this lane dequantizes
+  const int kq = (int)(lane >> 3); // k quarter (16 values each)
+  const int n = n0 + j;
+  const bool nValid = n < N;
+  const device uint32_t* wr =
+      w + (size_t)n * kw + (kbeg / pack) + kq * (16 / pack);
+  const device T* sr = scales + (size_t)n * kg;
+  const device T* br = biases + (size_t)n * kg;
+  uint32_t pNext[16 / pack];
+  float sNext = 0, bNext = 0;
+  if (nValid) {
+    sNext = (float)sr[kbeg >> 6];
+    bNext = (float)br[kbeg >> 6];
+#pragma unroll
+    for (int u = 0; u < 16 / pack; ++u) {
+      pNext[u] = wr[u];
+    }
+  }
   for (int kk = 0; kk < KPS; kk += 64) {
     const int ka = kbeg + kk; // multiple of 64: one quantization group covers
-    const int j = (int)(lane & 7); // n column this lane dequantizes
-    const int kq = (int)(lane >> 3); // k quarter (16 values each)
-    const int n = n0 + j;
-    if (n < N) {
-      const float s = (float)scales[(size_t)n * kg + (ka >> 6)];
-      const float bb = (float)biases[(size_t)n * kg + (ka >> 6)];
-      const device uint32_t* wr =
-          w + (size_t)n * kw + (ka / pack) + kq * (16 / pack);
+    const float s = sNext;
+    const float bb = bNext;
+    uint32_t pCur[16 / pack];
+#pragma unroll
+    for (int u = 0; u < 16 / pack; ++u) {
+      pCur[u] = pNext[u];
+    }
+    // Issue next iteration's loads before the barrier; consumed after the MMA.
+    if (nValid && kk + 64 < KPS) {
+      const device uint32_t* wn = wr + (64 / pack);
+      sNext = (float)sr[(ka + 64) >> 6];
+      bNext = (float)br[(ka + 64) >> 6];
 #pragma unroll
       for (int u = 0; u < 16 / pack; ++u) {
-        const uint32_t p = wr[u];
+        pNext[u] = wn[u];
+      }
+      wr = wn;
+    }
+    if (nValid) {
+#pragma unroll
+      for (int u = 0; u < 16 / pack; ++u) {
+        const uint32_t p = pCur[u];
 #pragma unroll
         for (int t = 0; t < pack; ++t) {
           bt[(kq * 16 + u * pack + t) * 8 + j] =
