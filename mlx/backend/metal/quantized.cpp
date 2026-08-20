@@ -1365,6 +1365,66 @@ void gather_qmm_rhs(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// One 8x8 MMA tile per 8 output columns: the quantized weights are read and
+// dequantized once and reused across all M <= 8 rows (qmv_wide re-streams them
+// per 5-row tile), so the M in [6, 8] verify window stops scaling in M.
+// Non-batched, 2-byte activations only (the threadgroup stages are sized for
+// it); everything else falls through to qmv_wide.
+inline bool use_qmm_mma8(
+    const std::string& mode,
+    int M,
+    int N,
+    int K,
+    int group_size,
+    int bits,
+    const array& x,
+    const std::optional<array>& biases,
+    const array& out) {
+  return mode == "affine" && biases.has_value() && M >= 5 && M <= 8 &&
+      group_size == 64 && (bits == 4 || bits == 8) && N >= 4096 &&
+      K % 512 == 0 && out.size() == static_cast<size_t>(M) * N &&
+      x.dtype() == bfloat16;
+}
+
+void qmm_mma8(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  concatenate(
+      kname, "affine_qmm_mma8_", type_string, "_gs_", group_size, "_b_", bits);
+  auto kernel = get_quantized_kernel_wrapped(
+      d, kname, "qmm_mma8", "affine", type_string, group_size, bits);
+
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(*biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims((N + 7) / 8, 1, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void dispatch_qmv(
     const array& x,
     const array& w,
@@ -1382,6 +1442,12 @@ void dispatch_qmv(
   // It is a qmv with a small inner dimension so route to qmv_quad kernel
   if ((K == 128 || K == 64) && is_power_of_2(bits)) {
     qmv_quad(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+    return;
+  }
+
+  // Verify-window batch (M in [6, 8]): one weight stream via the MMA tile.
+  if (use_qmm_mma8(mode, M, N, K, group_size, bits, x, biases, out)) {
+    qmm_mma8(x, w, scales, biases, out, group_size, bits, M, N, K, d, s);
     return;
   }
 

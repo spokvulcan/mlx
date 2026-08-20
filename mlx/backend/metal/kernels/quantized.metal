@@ -130,6 +130,13 @@
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 4, 8) \
   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 5, 8)
 
+// Small-M MMA tile (one 8x8 simdgroup matrix covers M <= 8): affine gs64,
+// 4/8-bit. 2-byte types only — the threadgroup stages would exceed 32 KB at
+// sizeof(T) == 4 (host dispatch gates the same way).
+#define instantiate_quantized_all_mma8(type) \
+  instantiate_quantized(affine_qmm_mma8, type, 64, 4) \
+  instantiate_quantized(affine_qmm_mma8, type, 64, 8)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)
@@ -164,5 +171,8 @@
   instantiate_quantized_groups(5) \
   instantiate_quantized_groups(6) \
   instantiate_quantized_groups(8)
+
+instantiate_quantized_all_mma8(float16_t)
+instantiate_quantized_all_mma8(bfloat16_t)
 
 instantiate_quantized_all() // clang-format on

@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 #include <metal_stdlib>
 
 constant bool align_M [[function_constant(200)]];
@@ -2660,6 +2661,116 @@ template <typename T, const int group_size, const int bits>
         d = val;
       }
       out[i] = scale * d + bias;
+    }
+  }
+}
+
+// Small-M affine QMM: one 8x8 simdgroup MMA tile covers M <= 8 exactly, so
+// each quantized weight group is read and dequantized ONCE and reused by every
+// row (qmv_wide re-streams the weights per 5-row tile). K is split across the
+// threadgroup's 8 simdgroups (split-K) so the serial loop per simdgroup is
+// short. The A tile reads x straight from device memory (no staging — keeps
+// threadgroup memory at 10 KB so three threadgroups stay resident per core);
+// rows >= M are clamped onto row M-1 and their results never stored.
+// Dispatched for 6 <= M <= 8, group_size 64, bits 4/8, N >= 4096, K % 512 == 0,
+// non-batched. fp32 accumulation. Port of avlp12's qmm_mma4 (MIT), via
+// jundot/omlx's small_m_qmm.py.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmm_mma8(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  static_assert(
+      group_size == 64, "affine_qmm_mma8 stages one quantization group");
+  static_assert(bits == 4 || bits == 8, "affine_qmm_mma8 covers 4/8-bit");
+  constexpr int pack = 32 / bits; // values per packed uint32
+
+  const int KPS = K / 8; // K-span per simdgroup (split-K over 8 simdgroups)
+  const uint sg = tid >> 5;
+  const uint lane = tid & 31;
+  const int n0 = (int)tgid.x * 8; // one threadgroup -> 8 output columns
+
+  threadgroup T bs[8 * 512]; // per-simdgroup 64k x 8n dequant stage
+  threadgroup float red[8 * 64]; // cross-simdgroup reduction
+
+  simdgroup_matrix<float, 8, 8> C(0);
+  threadgroup T* bt = bs + sg * 512;
+
+  const int kg = K / group_size; // scale/bias row stride
+  const int kw = K / pack; // packed-weight row stride (uint32s)
+  const uint32_t qmask = (1u << bits) - 1;
+
+  // The A fragment this lane holds of the 8x8 tile (Metal simdgroup_matrix
+  // 8x8 layout, same mapping as conv.metal's winograd transform): row
+  // ((lane/4) & 4) + ((lane/2) % 4), columns 2*((lane/4) & 2) + 2*(lane%2)
+  // and its +1. Row clamp keeps the device read in bounds for M < 8.
+  const int qid = (int)(lane >> 2);
+  const int am = min((qid & 4) + (int)((lane >> 1) & 3), M - 1);
+  const int acol = ((qid & 2) << 1) + ((int)(lane & 1) << 1);
+  const device T* arow = x + (size_t)am * K;
+
+  const int kbeg = (int)sg * KPS;
+  for (int kk = 0; kk < KPS; kk += 64) {
+    const int ka = kbeg + kk; // multiple of 64: one quantization group covers
+    const int j = (int)(lane & 7); // n column this lane dequantizes
+    const int kq = (int)(lane >> 3); // k quarter (16 values each)
+    const int n = n0 + j;
+    if (n < N) {
+      const float s = (float)scales[(size_t)n * kg + (ka >> 6)];
+      const float bb = (float)biases[(size_t)n * kg + (ka >> 6)];
+      const device uint32_t* wr =
+          w + (size_t)n * kw + (ka / pack) + kq * (16 / pack);
+#pragma unroll
+      for (int u = 0; u < 16 / pack; ++u) {
+        const uint32_t p = wr[u];
+#pragma unroll
+        for (int t = 0; t < pack; ++t) {
+          bt[(kq * 16 + u * pack + t) * 8 + j] =
+              (T)((float)((p >> (bits * t)) & qmask) * s + bb);
+        }
+      }
+    } else {
+#pragma unroll
+      for (int t = 0; t < 16; ++t) {
+        bt[(kq * 16 + t) * 8 + j] = (T)0;
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_matrix<T, 8, 8> A, B;
+    const device T* aptr = arow + ka;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      A.thread_elements()[0] = aptr[kt * 8 + acol];
+      A.thread_elements()[1] = aptr[kt * 8 + acol + 1];
+      simdgroup_load(B, bt + kt * 64, 8);
+      simdgroup_multiply_accumulate(C, A, B, C);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  simdgroup_store(C, red + sg * 64, 8);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Sum the 8 split-K partials and write out.
+  for (int i = (int)tid; i < 64; i += 256) {
+    const int m = i >> 3;
+    const int j = i & 7;
+    const int n = n0 + j;
+    if (m < M && n < N) {
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        v += red[q * 64 + i];
+      }
+      y[(size_t)m * N + n] = (T)v;
     }
   }
 }
