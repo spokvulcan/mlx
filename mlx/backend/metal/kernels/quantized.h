@@ -2669,12 +2669,20 @@ template <typename T, const int group_size, const int bits>
 // each quantized weight group is read and dequantized ONCE and reused by every
 // row (qmv_wide re-streams the weights per 5-row tile). K is split across the
 // threadgroup's 8 simdgroups (split-K) so the serial loop per simdgroup is
-// short. The A tile reads x straight from device memory (no staging — keeps
-// threadgroup memory at 10 KB so three threadgroups stay resident per core);
-// rows >= M are clamped onto row M-1 and their results never stored.
-// Dispatched for 6 <= M <= 8, group_size 64, bits 4/8, N >= 4096, K % 512 == 0,
-// non-batched. fp32 accumulation. Port of avlp12's qmm_mma4 (MIT), via
-// jundot/omlx's small_m_qmm.py.
+// short. Rows >= M are clamped onto row M-1 and their results never stored.
+// Two inner paths:
+//  - bits == 4 (direct-fragment): each lane dequantizes exactly the two
+//    8x8-B-fragment elements it owns — columns n0+fragCol/fragCol+1, field
+//    fragRow of each packed uint32. Every uint32 is requested by the 8 lanes
+//    of distinct fragRow at the same unrolled step, so the whole line is
+//    used with no threadgroup staging and no barriers; weight loads are two
+//    uint4 per column per 64-K block, A rows ride as preloaded packed
+//    uint32s.
+//  - bits == 8 (staged): dequant into a per-simdgroup threadgroup tile with
+//    a software-pipelined register prefetch behind the MMA chain.
+// Dispatched for 5 <= M <= 8, group_size 64, bits 4/8, N >= 4096, K % 512 == 0,
+// non-batched, bf16 activations. fp32 accumulation. Port of avlp12's qmm_mma4
+// (MIT), via jundot/omlx's small_m_qmm.py; the direct-fragment path is ours.
 template <typename T, int group_size, int bits>
 [[kernel]] void affine_qmm_mma8(
     const device uint32_t* w [[buffer(0)]],
@@ -2697,95 +2705,151 @@ template <typename T, int group_size, int bits>
   const uint lane = tid & 31;
   const int n0 = (int)tgid.x * 8; // one threadgroup -> 8 output columns
 
-  threadgroup T bs[8 * 512]; // per-simdgroup 64k x 8n dequant stage
   threadgroup float red[8 * 64]; // cross-simdgroup reduction
 
   simdgroup_matrix<float, 8, 8> C(0);
-  threadgroup T* bt = bs + sg * 512;
 
   const int kg = K / group_size; // scale/bias row stride
   const int kw = K / pack; // packed-weight row stride (uint32s)
   const uint32_t qmask = (1u << bits) - 1;
 
-  // The A fragment this lane holds of the 8x8 tile (Metal simdgroup_matrix
-  // 8x8 layout, same mapping as conv.metal's winograd transform): row
-  // ((lane/4) & 4) + ((lane/2) % 4), columns 2*((lane/4) & 2) + 2*(lane%2)
-  // and its +1. Row clamp keeps the device read in bounds for M < 8.
+  // The 8x8 fragment this lane holds (Metal simdgroup_matrix 8x8 layout,
+  // same mapping as conv.metal's winograd transform): row ((lane/4) & 4) +
+  // ((lane/2) % 4), columns 2*((lane/4) & 2) + 2*(lane%2) and its +1. The
+  // row clamp keeps the A reads in bounds for M < 8.
   const int qid = (int)(lane >> 2);
-  const int am = min((qid & 4) + (int)((lane >> 1) & 3), M - 1);
+  const int fragRow = (qid & 4) + (int)((lane >> 1) & 3);
+  const int am = min(fragRow, M - 1);
   const int acol = ((qid & 2) << 1) + ((int)(lane & 1) << 1);
   const device T* arow = x + (size_t)am * K;
 
   const int kbeg = (int)sg * KPS;
-  // Software pipeline: the packed weights + scale/bias for iteration kk+64 are
-  // loaded into registers while the MMA chain for kk runs, hiding the
-  // streaming-load latency behind 8 MMAs instead of exposing it per barrier.
-  const int j = (int)(lane & 7); // n column this lane dequantizes
-  const int kq = (int)(lane >> 3); // k quarter (16 values each)
-  const int n = n0 + j;
-  const bool nValid = n < N;
-  const device uint32_t* wr =
-      w + (size_t)n * kw + (kbeg / pack) + kq * (16 / pack);
-  const device T* sr = scales + (size_t)n * kg;
-  const device T* br = biases + (size_t)n * kg;
-  uint32_t pNext[16 / pack];
-  float sNext = 0, bNext = 0;
-  if (nValid) {
-    sNext = (float)sr[kbeg >> 6];
-    bNext = (float)br[kbeg >> 6];
-#pragma unroll
-    for (int u = 0; u < 16 / pack; ++u) {
-      pNext[u] = wr[u];
-    }
-  }
-  for (int kk = 0; kk < KPS; kk += 64) {
-    const int ka = kbeg + kk; // multiple of 64: one quantization group covers
-    const float s = sNext;
-    const float bb = bNext;
-    uint32_t pCur[16 / pack];
-#pragma unroll
-    for (int u = 0; u < 16 / pack; ++u) {
-      pCur[u] = pNext[u];
-    }
-    // Issue next iteration's loads before the barrier; consumed after the MMA.
-    if (nValid && kk + 64 < KPS) {
-      const device uint32_t* wn = wr + (64 / pack);
-      sNext = (float)sr[(ka + 64) >> 6];
-      bNext = (float)br[(ka + 64) >> 6];
-#pragma unroll
-      for (int u = 0; u < 16 / pack; ++u) {
-        pNext[u] = wn[u];
+
+  if constexpr (bits == 4) {
+    // Direct-fragment path: no staging, no barriers. Lane fragment:
+    // B(fragRow, acol), B(fragRow, acol+1) per 8-k step; at 4 bits the
+    // kt-th uint32 of a column's 64-k block holds k = block + 8*kt .. +7,
+    // so this lane's value is field fragRow of uint32 kt — consecutive,
+    // so the block's 8 uint32 load as two uint4.
+    const int nA = n0 + acol;
+    const bool aValid = nA < N;
+    const bool bValid = nA + 1 < N;
+    const device uint32_t* wa = w + (size_t)nA * kw;
+    const device uint32_t* wb = wa + kw;
+    const device T* sa = scales + (size_t)nA * kg;
+    const device T* sb = sa + kg;
+    const device T* ba = biases + (size_t)nA * kg;
+    const device T* bb = ba + kg;
+    const uint sh = (uint)(fragRow * bits);
+
+    for (int kk = 0; kk < KPS; kk += 64) {
+      const int ka = kbeg + kk;
+      const int g = ka >> 6; // quantization group index
+      const int woff = ka / pack; // 64 values = 8 uint32 at 4-bit
+      uint32_t pa[8] = {0}, pb[8] = {0}, ax[8];
+      float s0 = 0, b0 = 0, s1 = 0, b1 = 0;
+      if (aValid) {
+        s0 = (float)sa[g];
+        b0 = (float)ba[g];
+        *(thread uint4*)(pa) = *((const device uint4*)(wa + woff));
+        *(thread uint4*)(pa + 4) = *((const device uint4*)(wa + woff) + 1);
       }
-      wr = wn;
+      if (bValid) {
+        s1 = (float)sb[g];
+        b1 = (float)bb[g];
+        *(thread uint4*)(pb) = *((const device uint4*)(wb + woff));
+        *(thread uint4*)(pb + 4) = *((const device uint4*)(wb + woff) + 1);
+      }
+#pragma unroll
+      for (int kt = 0; kt < 8; ++kt) {
+        ax[kt] = *(const device uint32_t*)(arow + ka + kt * 8 + acol);
+      }
+      simdgroup_matrix<T, 8, 8> A, B;
+#pragma unroll
+      for (int kt = 0; kt < 8; ++kt) {
+        A.thread_elements()[0] = as_type<T>((ushort)(ax[kt] & 0xffffu));
+        A.thread_elements()[1] = as_type<T>((ushort)(ax[kt] >> 16));
+        B.thread_elements()[0] = (T)((float)((pa[kt] >> sh) & qmask) * s0 + b0);
+        B.thread_elements()[1] = (T)((float)((pb[kt] >> sh) & qmask) * s1 + b1);
+        simdgroup_multiply_accumulate(C, A, B, C);
+      }
     }
+  } else {
+    threadgroup T bs[8 * 512]; // per-simdgroup 64k x 8n dequant stage
+    threadgroup T* bt = bs + sg * 512;
+
+    // Software pipeline: the packed weights + scale/bias for iteration kk+64
+    // are loaded into registers while the MMA chain for kk runs, hiding the
+    // streaming-load latency behind 8 MMAs instead of exposing it per
+    // barrier.
+    const int j = (int)(lane & 7); // n column this lane dequantizes
+    const int kq = (int)(lane >> 3); // k quarter (16 values each)
+    const int n = n0 + j;
+    const bool nValid = n < N;
+    const device uint32_t* wr =
+        w + (size_t)n * kw + (kbeg / pack) + kq * (16 / pack);
+    const device T* sr = scales + (size_t)n * kg;
+    const device T* br = biases + (size_t)n * kg;
+    uint32_t pNext[16 / pack];
+    float sNext = 0, bNext = 0;
     if (nValid) {
+      sNext = (float)sr[kbeg >> 6];
+      bNext = (float)br[kbeg >> 6];
 #pragma unroll
       for (int u = 0; u < 16 / pack; ++u) {
-        const uint32_t p = pCur[u];
+        pNext[u] = wr[u];
+      }
+    }
+    for (int kk = 0; kk < KPS; kk += 64) {
+      const int ka = kbeg + kk; // multiple of 64: one quantization group covers
+      const float s = sNext;
+      const float bb = bNext;
+      uint32_t pCur[16 / pack];
 #pragma unroll
-        for (int t = 0; t < pack; ++t) {
-          bt[(kq * 16 + u * pack + t) * 8 + j] =
-              (T)((float)((p >> (bits * t)) & qmask) * s + bb);
+      for (int u = 0; u < 16 / pack; ++u) {
+        pCur[u] = pNext[u];
+      }
+      // Issue next iteration's loads before the barrier; consumed after the
+      // MMA.
+      if (nValid && kk + 64 < KPS) {
+        const device uint32_t* wn = wr + (64 / pack);
+        sNext = (float)sr[(ka + 64) >> 6];
+        bNext = (float)br[(ka + 64) >> 6];
+#pragma unroll
+        for (int u = 0; u < 16 / pack; ++u) {
+          pNext[u] = wn[u];
+        }
+        wr = wn;
+      }
+      if (nValid) {
+#pragma unroll
+        for (int u = 0; u < 16 / pack; ++u) {
+          const uint32_t p = pCur[u];
+#pragma unroll
+          for (int t = 0; t < pack; ++t) {
+            bt[(kq * 16 + u * pack + t) * 8 + j] =
+                (T)((float)((p >> (bits * t)) & qmask) * s + bb);
+          }
+        }
+      } else {
+#pragma unroll
+        for (int t = 0; t < 16; ++t) {
+          bt[(kq * 16 + t) * 8 + j] = (T)0;
         }
       }
-    } else {
-#pragma unroll
-      for (int t = 0; t < 16; ++t) {
-        bt[(kq * 16 + t) * 8 + j] = (T)0;
-      }
-    }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    simdgroup_matrix<T, 8, 8> A, B;
-    const device T* aptr = arow + ka;
+      simdgroup_matrix<T, 8, 8> A, B;
+      const device T* aptr = arow + ka;
 #pragma unroll
-    for (int kt = 0; kt < 8; ++kt) {
-      A.thread_elements()[0] = aptr[kt * 8 + acol];
-      A.thread_elements()[1] = aptr[kt * 8 + acol + 1];
-      simdgroup_load(B, bt + kt * 64, 8);
-      simdgroup_multiply_accumulate(C, A, B, C);
+      for (int kt = 0; kt < 8; ++kt) {
+        A.thread_elements()[0] = aptr[kt * 8 + acol];
+        A.thread_elements()[1] = aptr[kt * 8 + acol + 1];
+        simdgroup_load(B, bt + kt * 64, 8);
+        simdgroup_multiply_accumulate(C, A, B, C);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
     }
-    simdgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   simdgroup_store(C, red + sg * 64, 8);
