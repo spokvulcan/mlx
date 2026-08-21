@@ -199,6 +199,11 @@ template <typename T, int D, int V = D>
     const constant int& mask_head_stride
     [[buffer(17), function_constant(has_mask)]],
     const device T* sinks [[buffer(18), function_constant(has_sinks)]],
+    // Full query sequence length. The threadgroup z extent covers only a
+    // CHUNK of the query positions when q_seq_len * gqa_factor would exceed
+    // the 1024-thread cap; tid.y then packs (batch, q-chunk). Causal
+    // alignment and the output stride must use the full length, not tptg.z.
+    const constant int& q_seq_len_param [[buffer(19)]],
     uint3 tptg [[threads_per_threadgroup]],
     uint3 tidtg [[thread_position_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -215,11 +220,20 @@ template <typename T, int D, int V = D>
 
   // Adjust positions
   const int kv_head_idx = tid.x;
-  const int batch_idx = tid.y;
   const int block_idx = tid.z;
   const int gqa_factor = tptg.y;
-  const int q_seq_len = tptg.z;
-  const int q_seq_idx = tidtg.z;
+  const int q_seq_len = q_seq_len_param;
+  // Unpack (batch, q-chunk) from tid.y; this threadgroup's z covers
+  // [q_chunk_idx * tptg.z, ...) of the full query sequence.
+  const int num_q_chunks = (q_seq_len + (int)tptg.z - 1) / (int)tptg.z;
+  const int batch_idx = tid.y / num_q_chunks;
+  const int q_chunk_idx = tid.y % num_q_chunks;
+  const int q_seq_idx = q_chunk_idx * (int)tptg.z + (int)tidtg.z;
+  if (q_seq_idx >= q_seq_len) {
+    // Tail chunk shorter than the threadgroup z extent: no barriers in this
+    // kernel, so an early return is safe (no loads/stores may happen below).
+    return;
+  }
   const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
   const int num_kv_heads = tpg.x;
   const int num_q_heads = num_kv_heads * gqa_factor;

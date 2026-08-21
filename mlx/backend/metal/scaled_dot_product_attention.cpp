@@ -478,8 +478,17 @@ void sdpa_vector_2pass(
   size_t k_seq_stride = k.strides()[2];
   size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
   size_t v_seq_stride = v.strides()[2];
-  MTL::Size group_dims(32, gqa_factor, q.shape(2));
-  MTL::Size grid_dims(k.shape(1), q.shape(0), blocks);
+  // qL tiling: the threadgroup is (32 lanes, gqa, q_per_tg) and must fit the
+  // 1024-thread cap, so qL * gqa > 32 splits the query axis into balanced
+  // chunks packed into grid.y with the batch. The kernel reads the FULL
+  // query length from buffer 19 (chunk-independent causal alignment and
+  // output stride). Balanced: qL=8, gqa=6 -> 2 chunks of 4 (not 5+3).
+  const int q_seq_len = q.shape(2);
+  const int max_q_per_tg = std::max(1, 32 / gqa_factor);
+  const int num_q_chunks = (q_seq_len + max_q_per_tg - 1) / max_q_per_tg;
+  const int q_per_tg = (q_seq_len + num_q_chunks - 1) / num_q_chunks;
+  MTL::Size group_dims(32, gqa_factor, q_per_tg);
+  MTL::Size grid_dims(k.shape(1), q.shape(0) * num_q_chunks, blocks);
 
   // Allocate the intermediates
   Shape intermediate_shape;
@@ -540,6 +549,7 @@ void sdpa_vector_2pass(
   compute_encoder.set_bytes(v_head_stride, 10);
   compute_encoder.set_bytes(v_seq_stride, 11);
   compute_encoder.set_bytes(scale, 12);
+  compute_encoder.set_bytes(q_seq_len, 19);
   if (has_mask) {
     auto& m = *mask;
     compute_encoder.set_input_array(m, 13 + float_mask);
@@ -628,10 +638,18 @@ bool ScaledDotProductAttention::use_fallback(
   const bool supports_sdpa_full = query_sequence_length > 8 &&
       sdpa_full_supported_mask && sdpa_full_supported_head_dim;
 
+  // qL * gqa > 32 overflows the 1024-thread (32-lane x gqa x qL) threadgroup
+  // of the vector kernels. The 2-pass path tiles the query axis across
+  // grid.y (see sdpa_vector_2pass), so it serves any qL <= 8 with
+  // gqa <= 32; the 1-pass kernel keeps the 32-simdgroup cap.
+  char devc = metal::device(s.device).get_architecture().back();
+  const bool two_pass_serves = gqa_factor <= 32 &&
+      (((devc == 'd' || devc == 's') && key_sequence_length >= 1024) ||
+       (num_kv_heads < num_query_heads && key_sequence_length >= 4096));
   const bool supports_sdpa_vector = (query_sequence_length <= 8) &&
       (query_sequence_length <= key_sequence_length) &&
       sdpa_vector_supported_head_dim &&
-      (query_sequence_length * gqa_factor) <= 32;
+      ((query_sequence_length * gqa_factor) <= 32 || two_pass_serves);
 
   return !(supports_sdpa_full || supports_sdpa_vector);
 }
