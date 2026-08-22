@@ -26,6 +26,12 @@ using namespace metal;
       sdpa_vector_2pass_1,                                     \
       type,                                                    \
       qk_dim,                                                  \
+      value_dim)                                               \
+  instantiate_kernel(                                             \
+      "sdpa_vector_2pass_1_mq_" #type "_" #qk_dim "_" #value_dim, \
+      sdpa_vector_2pass_1_mq,                                     \
+      type,                                                       \
+      qk_dim,                                                     \
       value_dim)
 
 #define instantiate_sdpa_vector_heads(type)      \

@@ -331,6 +331,204 @@ template <typename T, int D, int V = D>
   }
 }
 
+// Multi-query variant of sdpa_vector_2pass_1 for short query blocks
+// (speculative verify): each simdgroup holds QPS consecutive query positions
+// in registers and streams every K/V row of its block ONCE, amortizing the
+// dominant cost — the per-simdgroup KV stream — across those queries (the
+// single-query kernel re-streams the block's K/V once per query, so its cost
+// grows linearly in qL). Per-query arithmetic (element partitioning,
+// simd_sum reduction, softmax accumulation order over keys) is identical to
+// sdpa_vector_2pass_1, so each query's partials are the same values the
+// single-query kernel produces.
+template <typename T, int D, int V = D, int QPS = 2>
+[[kernel]] void sdpa_vector_2pass_1_mq(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(7)]],
+    const constant size_t& k_head_stride [[buffer(8)]],
+    const constant size_t& k_seq_stride [[buffer(9)]],
+    const constant size_t& v_head_stride [[buffer(10)]],
+    const constant size_t& v_seq_stride [[buffer(11)]],
+    const constant float& scale [[buffer(12)]],
+    const device bool* bmask [[buffer(13), function_constant(bool_mask)]],
+    const device T* fmask [[buffer(14), function_constant(float_mask)]],
+    const constant int& mask_kv_seq_stride
+    [[buffer(15), function_constant(has_mask)]],
+    const constant int& mask_q_seq_stride
+    [[buffer(16), function_constant(has_mask)]],
+    const constant int& mask_head_stride
+    [[buffer(17), function_constant(has_mask)]],
+    const device T* sinks [[buffer(18), function_constant(has_sinks)]],
+    const constant int& q_seq_len_param [[buffer(19)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+
+  typedef float U;
+
+  thread U q[QPS][qk_per_thread];
+  thread U o[QPS][v_per_thread];
+  thread U max_score[QPS];
+  thread U sum_exp_score[QPS];
+
+  // Adjust positions
+  const int kv_head_idx = tid.x;
+  const int block_idx = tid.z;
+  const int gqa_factor = tptg.y;
+  const int q_seq_len = q_seq_len_param;
+  // Each z slice covers QPS consecutive query positions; tid.y packs
+  // (batch, q-chunk) exactly like the single-query kernel.
+  const int q_per_tg = (int)tptg.z * QPS;
+  const int num_q_chunks = (q_seq_len + q_per_tg - 1) / q_per_tg;
+  const int batch_idx = tid.y / num_q_chunks;
+  const int q_chunk_idx = tid.y % num_q_chunks;
+  const int q_group_base = q_chunk_idx * q_per_tg + (int)tidtg.z * QPS;
+  if (q_group_base >= q_seq_len) {
+    // No barriers in this kernel, so an early return is safe.
+    return;
+  }
+  const int nq = min(QPS, q_seq_len - q_group_base);
+  const int q_head_idx = gqa_factor * kv_head_idx + tidtg.y;
+  const int num_kv_heads = tpg.x;
+  const int num_q_heads = num_kv_heads * gqa_factor;
+  const int q_batch_head_idx = (batch_idx * num_q_heads + q_head_idx);
+  const int o_row = q_batch_head_idx * q_seq_len + q_group_base;
+  const int q_row =
+      query_transposed ? num_q_heads * q_group_base + q_batch_head_idx : o_row;
+  const int q_row_stride = query_transposed ? num_q_heads : 1;
+
+  const int kv_batch_head_idx = batch_idx * num_kv_heads + kv_head_idx;
+  keys += kv_batch_head_idx * k_head_stride + block_idx * k_seq_stride +
+      simd_lid * qk_per_thread;
+  values += kv_batch_head_idx * v_head_stride + block_idx * v_seq_stride +
+      simd_lid * v_per_thread;
+  if (bool_mask) {
+    bmask += q_batch_head_idx * mask_head_stride +
+        block_idx * mask_kv_seq_stride + q_group_base * mask_q_seq_stride;
+  }
+  if (float_mask) {
+    fmask += q_batch_head_idx * mask_head_stride +
+        block_idx * mask_kv_seq_stride + q_group_base * mask_q_seq_stride;
+  }
+
+  // Read the group's queries and init the accumulators
+  for (int j = 0; j < QPS; j++) {
+    max_score[j] = Limits<U>::finite_min;
+    sum_exp_score[j] = 0;
+    for (int i = 0; i < v_per_thread; i++) {
+      o[j][i] = 0;
+    }
+    if (j < nq) {
+      const device T* qj =
+          queries + (q_row + j * q_row_stride) * D + simd_lid * qk_per_thread;
+      for (int i = 0; i < qk_per_thread; i++) {
+        q[j][i] = static_cast<U>(scale) * qj[i];
+      }
+    } else {
+      for (int i = 0; i < qk_per_thread; i++) {
+        q[j][i] = 0;
+      }
+    }
+  }
+  if (has_sinks && block_idx == 0) {
+    for (int j = 0; j < nq; j++) {
+      max_score[j] = static_cast<U>(sinks[q_head_idx]);
+      sum_exp_score[j] = 1;
+    }
+  }
+
+  // For each key: one load, applied to every query in the group
+  for (int i = block_idx; i < N; i += blocks) {
+    bool use_key_j[QPS];
+    bool any_key = false;
+    for (int j = 0; j < QPS; j++) {
+      bool use_key = j < nq;
+      if (use_key) {
+        if (do_causal) {
+          use_key = i <= (N - q_seq_len + q_group_base + j);
+        } else if (bool_mask) {
+          use_key = bmask[j * mask_q_seq_stride];
+        } else if (float_mask) {
+          use_key =
+              (fmask[j * mask_q_seq_stride] >= Limits<T>::finite_min);
+        }
+      }
+      use_key_j[j] = use_key;
+      any_key = any_key || use_key;
+    }
+
+    if (any_key) {
+      U kvals[qk_per_thread];
+      U vvals[v_per_thread];
+      for (int e = 0; e < qk_per_thread; e++) {
+        kvals[e] = keys[e];
+      }
+      for (int e = 0; e < v_per_thread; e++) {
+        vvals[e] = values[e];
+      }
+      for (int j = 0; j < QPS; j++) {
+        if (!use_key_j[j]) {
+          continue;
+        }
+        // Compute the i-th score for query j
+        U score = 0;
+        for (int e = 0; e < qk_per_thread; e++) {
+          score += q[j][e] * kvals[e];
+        }
+        score = simd_sum(score);
+
+        if (float_mask) {
+          score += fmask[j * mask_q_seq_stride];
+        }
+
+        // Update the accumulators
+        U new_max = max(max_score[j], score);
+        U factor = fast::exp(max_score[j] - new_max);
+        U exp_score = fast::exp(score - new_max);
+
+        max_score[j] = new_max;
+        sum_exp_score[j] = sum_exp_score[j] * factor + exp_score;
+
+        for (int e = 0; e < v_per_thread; e++) {
+          o[j][e] = o[j][e] * factor + exp_score * vvals[e];
+        }
+      }
+    }
+
+    // Move the pointers to the next kv
+    keys += blocks * int(k_seq_stride);
+    values += blocks * int(v_seq_stride);
+    if (bool_mask) {
+      bmask += blocks * mask_kv_seq_stride;
+    }
+    if (float_mask) {
+      fmask += blocks * mask_kv_seq_stride;
+    }
+  }
+
+  // Write the sums, maxes and outputs
+  for (int j = 0; j < nq; j++) {
+    if (simd_lid == 0) {
+      sums[(o_row + j) * blocks + block_idx] = sum_exp_score[j];
+      maxs[(o_row + j) * blocks + block_idx] = max_score[j];
+    }
+    device T* oj =
+        out + (o_row + j) * blocks * V + block_idx * V + simd_lid * v_per_thread;
+    for (int e = 0; e < v_per_thread; e++) {
+      oj[e] = static_cast<T>(o[j][e]);
+    }
+  }
+}
+
 template <typename T, int D>
 [[kernel]] void sdpa_vector_2pass_2(
     const device T* partials [[buffer(0)]],

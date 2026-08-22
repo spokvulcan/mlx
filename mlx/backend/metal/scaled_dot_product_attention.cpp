@@ -426,10 +426,17 @@ void sdpa_vector_2pass(
     bool do_causal,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
+  // Multi-query kernel for short query blocks (speculative verify): one
+  // simdgroup carries up to QPS consecutive queries, amortizing K/V access
+  // issue cost across them. Numerics per query are identical to
+  // sdpa_vector_2pass_1. QPS must match the kernel template default.
+  constexpr int QPS = 2;
+  const bool use_mq = q.shape(2) >= 2;
+
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
-  kname += "sdpa_vector_2pass_1_";
+  kname += use_mq ? "sdpa_vector_2pass_1_mq_" : "sdpa_vector_2pass_1_";
   kname += get_type_string(q.dtype());
   kname += "_";
   kname += std::to_string(q.shape(-1));
@@ -484,10 +491,21 @@ void sdpa_vector_2pass(
   // query length from buffer 19 (chunk-independent causal alignment and
   // output stride). Balanced: qL=8, gqa=6 -> 2 chunks of 4 (not 5+3).
   const int q_seq_len = q.shape(2);
-  const int max_q_per_tg = std::max(1, 32 / gqa_factor);
-  const int num_q_chunks = (q_seq_len + max_q_per_tg - 1) / max_q_per_tg;
-  const int q_per_tg = (q_seq_len + num_q_chunks - 1) / num_q_chunks;
-  MTL::Size group_dims(32, gqa_factor, q_per_tg);
+  int num_q_chunks;
+  int z_ext;
+  if (use_mq) {
+    // Each z slice covers QPS queries; the mq kernel derives its chunk
+    // count as ceil(qL / (tptg.z * QPS)), so num_q_chunks must match that.
+    const int max_z = std::max(1, 32 / gqa_factor);
+    const int groups_total = (q_seq_len + QPS - 1) / QPS;
+    z_ext = std::min(groups_total, max_z);
+    num_q_chunks = (q_seq_len + z_ext * QPS - 1) / (z_ext * QPS);
+  } else {
+    const int max_q_per_tg = std::max(1, 32 / gqa_factor);
+    num_q_chunks = (q_seq_len + max_q_per_tg - 1) / max_q_per_tg;
+    z_ext = (q_seq_len + num_q_chunks - 1) / num_q_chunks;
+  }
+  MTL::Size group_dims(32, gqa_factor, z_ext);
   MTL::Size grid_dims(k.shape(1), q.shape(0) * num_q_chunks, blocks);
 
   // Allocate the intermediates
