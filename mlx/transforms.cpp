@@ -1,14 +1,20 @@
 // Copyright © 2023-2024 Apple Inc.
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <future>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <set>
 #include <sstream>
 #include <stack>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "mlx/backend/cpu/eval.h"
 #include "mlx/backend/gpu/eval.h"
@@ -23,7 +29,83 @@
 
 namespace mlx::core {
 
-static constexpr int MAX_ACTIVE_TASKS = 10;
+// C10 (tesseract): env-tunable in-flight command-buffer cap. The encode
+// thread blocks (wait_for_one) once this many committed buffers are
+// uncompleted, pacing graph scheduling to the GPU. A deeply pipelined decode
+// that schedules the NEXT round's whole pass ahead of time needs the host to
+// run further ahead than 10 buffers, or the GPU drains at the round seam
+// while the host is still throttled. Default unchanged. Lazily initialized
+// (first eval, not image load) so an embedding app can setenv before its
+// first MLX call.
+static int max_active_tasks() {
+  static const int cap = []() {
+    const char* v = getenv("MLX_MAX_ACTIVE_TASKS");
+    if (v != nullptr) {
+      int parsed = atoi(v);
+      if (parsed > 0) {
+        return parsed;
+      }
+    }
+    return 10;
+  }();
+  return cap;
+}
+
+// Op census (tesseract, diagnostic): with MLX_OP_CENSUS=1, count primitive
+// dispatches by name, dumped to stderr at exit. Recording is windowed by
+// MLX_OP_CENSUS_ACTIVE, which the embedding app toggles around the section
+// being measured (getenv per record is acceptable in diagnostic runs).
+// Counts are primitive dispatches, not GPU kernel launches — multi-kernel
+// primitives (2-pass SDPA) and eval-internal copies count as one.
+namespace {
+std::mutex g_op_census_mutex;
+std::map<std::string, long>* g_op_census_counts = nullptr;
+
+void op_census_dump() {
+  std::lock_guard<std::mutex> lock(g_op_census_mutex);
+  if (g_op_census_counts == nullptr) {
+    return;
+  }
+  long total = 0;
+  for (auto& kv : *g_op_census_counts) {
+    total += kv.second;
+  }
+  fprintf(stderr, "[op-census] total=%ld\n", total);
+  std::vector<std::pair<long, std::string>> rows;
+  rows.reserve(g_op_census_counts->size());
+  for (auto& kv : *g_op_census_counts) {
+    rows.emplace_back(kv.second, kv.first);
+  }
+  std::sort(rows.rbegin(), rows.rend());
+  for (auto& r : rows) {
+    fprintf(stderr, "[op-census] %8ld  %s\n", r.first, r.second.c_str());
+  }
+}
+
+bool op_census_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_OP_CENSUS");
+    if (env != nullptr && env[0] == '1') {
+      std::atexit(op_census_dump);
+      return true;
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+void op_census_record(const char* name) {
+  const char* active = std::getenv("MLX_OP_CENSUS_ACTIVE");
+  if (active == nullptr || active[0] != '1') {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_op_census_mutex);
+  if (g_op_census_counts == nullptr) {
+    g_op_census_counts = new std::map<std::string, long>();
+  }
+  (*g_op_census_counts)[name] += 1;
+}
+} // namespace
 
 /* This class is only meant to be used in eval
  * for synchronizing with the main thread. */
@@ -415,13 +497,17 @@ array eval_impl(std::vector<array> outputs, bool async) {
       }
     }
 
+    if (op_census_enabled()) {
+      op_census_record(arr.primitive().name());
+    }
+
     if (arr.primitive().device() == Device::gpu) {
       gpu::eval(arr);
     } else {
       cpu::eval(arr);
     }
 
-    if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+    if (scheduler::n_active_tasks() > max_active_tasks() ||
         (get_active_memory() > get_memory_limit() &&
          scheduler::n_active_tasks() > 0)) {
       // Commit any open streams
