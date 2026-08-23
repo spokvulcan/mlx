@@ -11,6 +11,7 @@
 #endif
 
 #include <cassert>
+#include <cstdlib>
 
 #if defined(MLX_USE_CUDA)
 #define MLX_PROFILER_RANGE(message) nvtx3::scoped_range r(message)
@@ -125,8 +126,42 @@ void DynamicSliceUpdate::eval_gpu(
     return;
   }
 
-  // Copy or donate input to output
   auto s = stream();
+
+  // C9 (tesseract): opt-in in-place dynamic slice update. The default path
+  // below copies the WHOLE destination buffer whenever donation fails — and
+  // under a pipelined decode the previous rounds' still-executing readers
+  // always hold references at encode time, so a rolling KV buffer pays a
+  // full-store copy per write (~2.5 GB/round measured). With the flag set,
+  // the output aliases the input buffer and only the updated rows are
+  // written. This is safe ONLY when the caller guarantees every reader
+  // encoded before this write either completes earlier on the same stream
+  // or cannot see the written region (DFlash2's verify masks do both).
+  static const bool inplace_enabled = []() {
+    const char* v = getenv("MLX_DYNSLICE_INPLACE");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (inplace_enabled && in.dtype() == out.dtype() && in.flags().contiguous &&
+      in.size() == in.data_size()) {
+    out.copy_shared_buffer(in);
+    auto inplace_offset =
+        compute_dynamic_offset(start_indices, out.strides(), axes_, s);
+    copy_gpu_inplace(
+        /* const array& src = */ upd,
+        /* array& dst = */ out,
+        /* const Shape& data_shape = */ upd.shape(),
+        /* const Strides& i_strides = */ upd.strides(),
+        /* const Strides& o_strides = */ out.strides(),
+        /* int64_t i_offset = */ 0,
+        /* int64_t o_offset = */ 0,
+        /* CopyType ctype = */ CopyType::GeneralGeneral,
+        /* const Stream& s = */ s,
+        /* std::optional<array> dynamic_i_offset = */ std::nullopt,
+        /* std::optional<array> dynamic_o_offset = */ std::move(inplace_offset));
+    return;
+  }
+
+  // Copy or donate input to output
   auto ctype = in.flags().contiguous && in.size() == in.data_size()
       ? CopyType::Vector
       : CopyType::General;
