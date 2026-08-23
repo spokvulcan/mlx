@@ -137,6 +137,19 @@
   instantiate_quantized(affine_qmm_mma8, type, 64, 4) \
   instantiate_quantized(affine_qmm_mma8, type, 64, 8)
 
+// 16-row variant (two stacked A fragments per B fragment): affine gs64,
+// 4-bit direct-fragment only.
+#define instantiate_quantized_all_mma16(type) \
+  instantiate_quantized(affine_qmm_mma16, type, 64, 4)
+
+// 16-wide-N variant (two adjacent 8-column tiles share the A fragments):
+// affine gs64, 4-bit direct-fragment only.
+#define instantiate_quantized_all_mma8n16(type) \
+  instantiate_quantized(affine_qmm_mma8n16, type, 64, 4)
+
+#define instantiate_quantized_all_mma8n32(type) \
+  instantiate_quantized(affine_qmm_mma8n32, type, 64, 4)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)
@@ -174,5 +187,13 @@
 
 instantiate_quantized_all_mma8(float16_t)
 instantiate_quantized_all_mma8(bfloat16_t)
+
+instantiate_quantized_all_mma16(float16_t)
+instantiate_quantized_all_mma16(bfloat16_t)
+
+instantiate_quantized_all_mma8n16(float16_t)
+instantiate_quantized_all_mma8n16(bfloat16_t)
+instantiate_quantized_all_mma8n32(float16_t)
+instantiate_quantized_all_mma8n32(bfloat16_t)
 
 instantiate_quantized_all() // clang-format on

@@ -433,10 +433,37 @@ void sdpa_vector_2pass(
   constexpr int QPS = 2;
   const bool use_mq = q.shape(2) >= 2;
 
+  // GQA-packed MMA pass 1 (see sdpa_vector_2pass_1_mma): every query row
+  // sharing a KV head runs in one threadgroup on simdgroup MMA. Verify
+  // shape only — qL == 8, head_dim 256, gqa <= 6 (threadgroup extents),
+  // 2-byte dtype (threadgroup staging), causal or unmasked, no sinks.
+  // Default route for the eligible shape; MLX_SDPA_MMA=0 is the
+  // kill-switch back to the mq vector kernel. The env read costs once.
+  static const bool mma_enabled = []() {
+    const char* v = getenv("MLX_SDPA_MMA");
+    return v == nullptr || v[0] != '0';
+  }();
+  const bool use_mma = mma_enabled && q.shape(2) >= 7 && q.shape(2) <= 8 &&
+      q.shape(-1) == 256 && v.shape(-1) == 256 &&
+      (q.shape(1) / k.shape(1)) <= 6 &&
+      (!mask.has_value() || (*mask).dtype() == bool_) &&
+      !sinks.has_value() && q.dtype() != float32;
+  // The mma kernel reads a fixed 8-row query tile; qL = 7 is padded into a
+  // zeroed contiguous 8-row buffer (every kernel write is guarded to the
+  // real q_seq_len and the 8x8 MMAs are row-independent, so pad rows are
+  // unobservable; q_seq_len, buffer 19, stays the REAL length). The floor
+  // sits at 7 by measurement: the padded kernel does full 8-row work, so
+  // the old vector path wins at S <= 4 (3.15/5.40 vs 6.93/7.24 ms/pass at
+  // 9216) and ties at 5-6; pad-to-8 only pays where the tile is nearly
+  // full.
+  const bool mma_pad_q = use_mma && q.shape(2) < 8;
+
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
-  kname += use_mq ? "sdpa_vector_2pass_1_mq_" : "sdpa_vector_2pass_1_";
+  kname += use_mma
+      ? "sdpa_vector_2pass_1_mma_"
+      : (use_mq ? "sdpa_vector_2pass_1_mq_" : "sdpa_vector_2pass_1_");
   kname += get_type_string(q.dtype());
   kname += "_";
   kname += std::to_string(q.shape(-1));
@@ -505,7 +532,24 @@ void sdpa_vector_2pass(
     num_q_chunks = (q_seq_len + max_q_per_tg - 1) / max_q_per_tg;
     z_ext = (q_seq_len + num_q_chunks - 1) / num_q_chunks;
   }
-  MTL::Size group_dims(32, gqa_factor, z_ext);
+  if (use_mma) {
+    // One threadgroup per (KV head, batch, partition): (lanes, D-half,
+    // q-head stripe). Contiguous partitions; 64 keeps the merge kernel's
+    // 32-block loop whole and the grid past the core count.
+    // 256 partitions: the verify runs its 16 SDPAs serially between
+    // dependent segments, so the kernel must fill the machine alone —
+    // 1024 threadgroups beat 256 live (64 only wins when independent
+    // ops overlap, the probe's concurrent regime).
+    static const int mma_blocks = []() {
+      const char* v = getenv("MLX_SDPA_MMA_BLOCKS");
+      return v != nullptr ? atoi(v) : 256;
+    }();
+    blocks = mma_blocks;
+    num_q_chunks = 1;
+    z_ext = gqa_factor;
+  }
+  MTL::Size group_dims =
+      use_mma ? MTL::Size(32, 2, gqa_factor) : MTL::Size(32, gqa_factor, z_ext);
   MTL::Size grid_dims(k.shape(1), q.shape(0) * num_q_chunks, blocks);
 
   // Allocate the intermediates
@@ -529,7 +573,7 @@ void sdpa_vector_2pass(
   bool has_mask = mask.has_value();
   bool bool_mask = has_mask && (*mask).dtype() == bool_;
   bool float_mask = has_mask && !bool_mask;
-  bool query_transposed = !q.flags().row_contiguous;
+  bool query_transposed = mma_pad_q ? false : !q.flags().row_contiguous;
   bool has_sinks = sinks.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
@@ -547,6 +591,32 @@ void sdpa_vector_2pass(
   hash_name += has_sinks ? "_sinks_" : "_nosinks_";
   hash_name += std::to_string(blocks);
 
+  // Pad narrow query tiles for the mma kernel BEFORE binding the SDPA
+  // pipeline: the fill/copy below dispatch their own kernels through this
+  // stream's encoder, so they must fully precede set_compute_pipeline_state.
+  array q_mma = q;
+  if (mma_pad_q) {
+    array q_pad(
+        Shape{q.shape(0), q.shape(1), 8, q.shape(3)}, q.dtype(), nullptr, {});
+    array zero_arr = array(0, q.dtype());
+    fill_gpu(zero_arr, q_pad, s);
+    d.add_temporary(zero_arr, s.index);
+    d.add_temporary(q_pad, s.index);
+    array q_dst(q.shape(), q.dtype(), nullptr, {});
+    auto pad_flags = q_pad.flags();
+    pad_flags.row_contiguous = false;
+    pad_flags.col_contiguous = false;
+    pad_flags.contiguous = false;
+    Strides dst_strides{
+        static_cast<int64_t>(q.shape(1)) * 8 * q.shape(3),
+        static_cast<int64_t>(8) * q.shape(3),
+        static_cast<int64_t>(q.shape(3)),
+        1};
+    q_dst.copy_shared_buffer(q_pad, dst_strides, pad_flags, q_dst.size(), 0);
+    copy_gpu_inplace(q, q_dst, CopyType::GeneralGeneral, s);
+    q_mma = std::move(q_pad);
+  }
+
   // Get the kernel
   auto& compute_encoder = d.get_command_encoder(s.index);
   auto kernel = d.get_kernel(kname, hash_name, func_consts);
@@ -555,7 +625,7 @@ void sdpa_vector_2pass(
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Set its arguments
-  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(q_mma, 0);
   compute_encoder.set_input_array(k, 1);
   compute_encoder.set_input_array(v, 2);
   compute_encoder.set_output_array(intermediate, 3);

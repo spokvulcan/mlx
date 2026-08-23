@@ -1380,13 +1380,106 @@ inline bool use_qmm_mma8(
     const array& x,
     const std::optional<array>& biases,
     const array& out) {
-  return mode == "affine" && biases.has_value() && M >= 5 && M <= 8 &&
-      group_size == 64 && (bits == 4 || bits == 8) && N >= 4096 &&
+  // Experimental floor override: MLX_QMM_MMA8_MMIN lowers the mma8 M gate
+  // (default 5 = the measured pre-n16 crossover vs qmv_wide).
+  static const int m_min = []() {
+    const char* v = getenv("MLX_QMM_MMA8_MMIN");
+    return v ? atoi(v) : 5;
+  }();
+  return mode == "affine" && biases.has_value() && M >= m_min && M <= 8 &&
+      group_size == 64 && (bits == 4 || bits == 8) && N >= 2048 &&
       K % 512 == 0 && out.size() == static_cast<size_t>(M) * N &&
       x.dtype() == bfloat16;
 }
 
+// The 16-wide-N mma8 tile (affine_qmm_mma8n16) is the default 4-bit route;
+// MLX_QMM_MMA8_N16=0 is the kill-switch back to the 8-wide tile. The env
+// read costs once.
+inline bool qmm_mma8_n16_enabled() {
+  static const bool enabled = []() {
+    const char* v = getenv("MLX_QMM_MMA8_N16");
+    return v == nullptr || v[0] != '0';
+  }();
+  return enabled;
+}
+
 void qmm_mma8(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  // Tile width: 8 (base), 16 (default for 4-bit), or 32 (experimental
+  // opt-in, MLX_QMM_MMA8_N32=1 — register-heavy; census A/B decides).
+  static const bool n32_enabled = []() {
+    const char* v = getenv("MLX_QMM_MMA8_N32");
+    return v != nullptr && v[0] == '1';
+  }();
+  const bool n32 = bits == 4 && n32_enabled;
+  const bool n16 = !n32 && bits == 4 && qmm_mma8_n16_enabled();
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  const char* base = n32
+      ? "affine_qmm_mma8n32_"
+      : (n16 ? "affine_qmm_mma8n16_" : "affine_qmm_mma8_");
+  concatenate(
+      kname, base, type_string, "_gs_", group_size, "_b_", bits);
+  auto kernel = get_quantized_kernel_wrapped(
+      d,
+      kname,
+      n32 ? "qmm_mma8n32" : (n16 ? "qmm_mma8n16" : "qmm_mma8"),
+      "affine",
+      type_string,
+      group_size,
+      bits);
+
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(*biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+
+  MTL::Size group_dims(256, 1, 1);
+  MTL::Size grid_dims(
+      n32 ? (N + 31) / 32 : (n16 ? (N + 15) / 16 : (N + 7) / 8), 1, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// 16-row extension of the mma8 window: two stacked A fragments share each
+// dequantized B fragment, so the weight stream amortizes over M in [9, 16]
+// (today those M land on qmv_wide re-streams or the qmm_t tile, both far off
+// the small-M envelope). 4-bit direct-fragment only.
+inline bool use_qmm_mma16(
+    const std::string& mode,
+    int M,
+    int N,
+    int K,
+    int group_size,
+    int bits,
+    const array& x,
+    const std::optional<array>& biases,
+    const array& out) {
+  return mode == "affine" && biases.has_value() && M >= 9 && M <= 16 &&
+      group_size == 64 && bits == 4 && N >= 4096 && K % 512 == 0 &&
+      out.size() == static_cast<size_t>(M) * N && x.dtype() == bfloat16;
+}
+
+void qmm_mma16(
     const array& x,
     const array& w,
     const array& scales,
@@ -1403,9 +1496,9 @@ void qmm_mma8(
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
   concatenate(
-      kname, "affine_qmm_mma8_", type_string, "_gs_", group_size, "_b_", bits);
+      kname, "affine_qmm_mma16_", type_string, "_gs_", group_size, "_b_", bits);
   auto kernel = get_quantized_kernel_wrapped(
-      d, kname, "qmm_mma8", "affine", type_string, group_size, bits);
+      d, kname, "qmm_mma16", "affine", type_string, group_size, bits);
 
   auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder.set_compute_pipeline_state(kernel);
@@ -1486,6 +1579,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
   auto mode = quantization_mode_to_string(mode_);
+
+  // Speculative-verify batch (M in [9, 16]): one weight stream via the
+  // stacked MMA tile — checked before the vector-limit split because those M
+  // straddle it (9-11 route to qmv, 12+ to qmm, both far off this envelope).
+  if (transpose_ && non_batched &&
+      use_qmm_mma16(mode, M, N, K, group_size_, bits_, x, biases, out)) {
+    qmm_mma16(x, w, scales, biases, out, group_size_, bits_, M, N, K, d, s);
+    return;
+  }
+
   // It is a matrix matrix product.
   if (M >= vector_limit) {
     qmm(x,

@@ -529,6 +529,300 @@ template <typename T, int D, int V = D, int QPS = 2>
   }
 }
 
+// GQA-packed MMA pass 1 for the speculative-verify shape (qL == 8, big
+// head_dim): ONE threadgroup carries every query row that shares a KV head
+// (gqa q-heads x 8 qL = up to 8x8-row MMA stripes), so the KV stream is
+// read once and every dot product runs on simdgroup MMA instead of the
+// vector kernels' per-lane FMA chains (issue-bound at D == 256). Layout:
+// tidtg.z picks the q-head stripe (8 rows), tidtg.y picks the D-dhalf owned
+// for the output accumulation; a stripe's two halves each compute the
+// partial scores over their 128 dims and exchange them through
+// threadgroup memory, so S = Q.K^T is summed exactly once. Keys advance in
+// contiguous 32-key blocks per partition (`blocks` partitions over the key
+// axis, function constant 26); the merge in sdpa_vector_2pass_2 is
+// order-agnostic, so contiguous partitions coexist with the strided
+// vector kernels. Rows do online softmax redundantly per dhalf (identical
+// inputs, no exchange); the O rescale factor crosses lanes through the
+// per-stripe factor slots because a lane's softmax row (lane / 4) is not
+// its C-fragment row. K/V fragments load straight from the KV cache
+// (simdgroup_load, transpose for K^T) after a coalesced threadgroup
+// stage per block, zero-padded past N (the cache allocation can end flush
+// at N). Causal only, no mask arrays, no sinks,
+// qL == 8 exactly (fragment rows are not clamped) — the host routes
+// everything else to the vector kernels. fp32 accumulation throughout.
+template <typename T, int D>
+[[kernel]] void sdpa_vector_2pass_1_mma(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device T* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& N [[buffer(7)]],
+    const constant size_t& k_head_stride [[buffer(8)]],
+    const constant size_t& k_seq_stride [[buffer(9)]],
+    const constant size_t& v_head_stride [[buffer(10)]],
+    const constant size_t& v_seq_stride [[buffer(11)]],
+    const constant float& scale [[buffer(12)]],
+    const device bool* bmask [[buffer(13), function_constant(bool_mask)]],
+    const constant int& mask_kv_seq_stride
+    [[buffer(15), function_constant(has_mask)]],
+    const constant int& mask_q_seq_stride
+    [[buffer(16), function_constant(has_mask)]],
+    const constant int& mask_head_stride
+    [[buffer(17), function_constant(has_mask)]],
+    const constant int& q_seq_len_param [[buffer(19)]],
+    uint3 tptg [[threads_per_threadgroup]],
+    uint3 tidtg [[thread_position_in_threadgroup]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint3 tpg [[threadgroups_per_grid]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BK = 32; // keys per block
+  constexpr int QL = 8; // query rows per stripe (enforced by the host gate)
+  constexpr int H2 = D / 2; // dims owned per dhalf
+  constexpr int NT = H2 / 8; // 8x8 O tiles per dhalf
+
+  const int gqa = (int)tptg.z;
+  const int stripe = (int)tidtg.z; // q head within the KV-head group
+  const int dhalf = (int)tidtg.y; // D-dhalf this simdgroup accumulates
+  const int lane = (int)simd_lid;
+
+  const int kv_head_idx = (int)tid.x;
+  const int batch_idx = (int)tid.y;
+  const int part_idx = (int)tid.z;
+
+  // sS: per-dhalf partial scores (added after the barrier); sP: the
+  // softmaxed probabilities re-staged for the PV MMAs; sFactor: per-row O
+  // rescale factors; sKV: the current key block, then the current value
+  // block — staged coalesced and re-read as fragments, zero-padded past N.
+  // Extents cover gqa <= 6 at BK == 32.
+  threadgroup float sS[2 * 6 * QL * BK];
+  threadgroup T sP[6 * QL * BK];
+  threadgroup float sFactor[6 * QL];
+  // uint4-backed so the staging runs 16-byte loads (2-byte loads leave the
+  // stream load-issue-bound at a quarter of the machine's rate).
+  threadgroup uint4 sKV4[BK * D * 2 / 16];
+  threadgroup T* sKV = (threadgroup T*)sKV4;
+
+  const int num_kv_heads = (int)tpg.x;
+  const int num_q_heads = num_kv_heads * gqa;
+  const int q_head_idx = gqa * kv_head_idx + stripe;
+  const int q_batch_head_idx = batch_idx * num_q_heads + q_head_idx;
+  const int q_seq_len = q_seq_len_param;
+
+  // Contiguous partition of the key axis, extended to whole blocks; keys
+  // read past pEnd belong to the next partition and are masked, not
+  // skipped, so every partition sums an exact, disjoint key range.
+  const int span_blocks = (N + blocks * BK - 1) / (blocks * BK);
+  const int span = span_blocks * BK;
+  const int p0 = part_idx * span;
+  const int pEnd = min(p0 + span, N);
+
+  const device T* kHead = keys + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * k_head_stride;
+  const device T* vHead = values + (size_t)(batch_idx * num_kv_heads + kv_head_idx) * v_head_stride;
+
+  // Query fragments for this stripe's rows over this dhalf's dims, resident
+  // for the whole key loop. Row stride handles both query layouts.
+  const int q_ld = query_transposed ? num_q_heads * D : D;
+  const device T* qBase = queries +
+      (query_transposed
+           ? (size_t)(batch_idx * num_q_heads + q_head_idx) * D
+           : (size_t)q_batch_head_idx * 8 * D); // host pads q to 8 rows
+  simdgroup_matrix<T, 8, 8> Qf[NT];
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    simdgroup_load(
+        Qf[t], qBase, q_ld, ulong2((ulong)(dhalf * H2 + t * 8), 0));
+  }
+
+  // The C-fragment row this lane's thread_elements live on (Metal 8x8
+  // simdgroup_matrix layout; same mapping as affine_qmm_mma8) — NOT the
+  // row this lane owns in the scalar softmax below.
+  const int fragRow = (int)(((lane >> 2) & 4) + ((lane >> 1) & 3));
+  // Scalar softmax ownership: lane r*4+g owns row r's g-th quarter of
+  // the block's columns.
+  const int smRow = lane >> 2;
+  const int smCol = (lane & 3) * (BK / 4);
+
+  simdgroup_matrix<float, 8, 8> O[NT];
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    O[t] = simdgroup_matrix<float, 8, 8>(0);
+  }
+  float mRun = Limits<float>::finite_min; // running max of row smRow
+  float lRun = 0; // running exp-sum of row smRow
+  const int rowPos = N - q_seq_len + smRow; // causal limit of row smRow
+  // Bool-mask row for smRow (padded rows clamp to the last real row —
+  // their outputs are discarded by the guarded writeout).
+  const device bool* bmaskRow = bool_mask
+      ? bmask + q_batch_head_idx * mask_head_stride +
+          min(smRow, q_seq_len - 1) * mask_q_seq_stride
+      : nullptr;
+
+  threadgroup float* sSMine = sS + (dhalf * gqa + stripe) * (QL * BK);
+  threadgroup float* sSOther = sS + ((1 - dhalf) * gqa + stripe) * (QL * BK);
+  threadgroup T* sPMine = sP + stripe * (QL * BK);
+
+  const int tix = (int)(tidtg.z * 64 + tidtg.y * 32 + lane);
+  const int nthreads = (int)(tptg.y * tptg.z) * 32;
+
+  for (int n0 = p0; n0 < pEnd; n0 += BK) {
+    // Stage the key block coalesced in 16-byte lines (transposed fragment
+    // gathers straight from device memory are what killed the direct
+    // variant), zero-padded past N so the ragged block needs no special
+    // path. A line never crosses a key row (D * 2 is a multiple of 16).
+    constexpr int V4R = D * 2 / 16; // uint4 lines per key row
+    for (int i = tix; i < BK * V4R; i += nthreads) {
+      const int n = i / V4R;
+      const int c4 = i % V4R;
+      uint4 val = uint4(0);
+      if (n0 + n < N) {
+        val = *((const device uint4*)(kHead + (size_t)(n0 + n) * k_seq_stride) + c4);
+      }
+      sKV4[i] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Partial scores over this dhalf's dims: S_half[8, BK].
+    simdgroup_matrix<float, 8, 8> Sc[BK / 8];
+#pragma unroll
+    for (int c = 0; c < BK / 8; ++c) {
+      Sc[c] = simdgroup_matrix<float, 8, 8>(0);
+    }
+#pragma unroll
+    for (int c = 0; c < BK / 8; ++c) {
+      for (int t = 0; t < NT; ++t) {
+        simdgroup_matrix<T, 8, 8> Kf;
+        simdgroup_load(
+            Kf, sKV, (ulong)D,
+            ulong2((ulong)(dhalf * H2 + t * 8), (ulong)(c * 8)), true);
+        simdgroup_multiply_accumulate(Sc[c], Qf[t], Kf, Sc[c]);
+      }
+    }
+#pragma unroll
+    for (int c = 0; c < BK / 8; ++c) {
+      simdgroup_store(Sc[c], sSMine, (ulong)BK, ulong2((ulong)(c * 8), 0));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax on row smRow (both halves redundantly — identical
+    // inputs, saves an exchange). Masked: beyond this partition, beyond
+    // the causal limit, or past N.
+    float sv[BK / 4];
+    float rowMax = Limits<float>::finite_min;
+#pragma unroll
+    for (int j = 0; j < BK / 4; ++j) {
+      const int c = smCol + j;
+      const int kpos = n0 + c;
+      float s = (sSMine[smRow * BK + c] + sSOther[smRow * BK + c]) * scale;
+      const bool masked = kpos >= pEnd || kpos >= N ||
+          (do_causal && kpos > rowPos) ||
+          (bool_mask && !bmaskRow[kpos * mask_kv_seq_stride]);
+      sv[j] = masked ? Limits<float>::finite_min : s;
+      rowMax = max(rowMax, sv[j]);
+    }
+    rowMax = max(rowMax, simd_shuffle_xor(rowMax, 1));
+    rowMax = max(rowMax, simd_shuffle_xor(rowMax, 2));
+    const float mNew = max(mRun, rowMax);
+    // finite_min stays finite_min: fully-masked blocks contribute factor 1
+    // and zero probabilities rather than NaNs.
+    const float factor =
+        mRun == Limits<float>::finite_min ? 1.0f : fast::exp(mRun - mNew);
+    float rowSum = 0;
+#pragma unroll
+    for (int j = 0; j < BK / 4; ++j) {
+      const float p = sv[j] == Limits<float>::finite_min
+          ? 0.0f
+          : fast::exp(sv[j] - mNew);
+      sv[j] = p;
+      rowSum += p;
+    }
+    rowSum += simd_shuffle_xor(rowSum, 1);
+    rowSum += simd_shuffle_xor(rowSum, 2);
+    lRun = lRun * factor + rowSum;
+    mRun = mNew;
+    if (dhalf == 0) {
+      if ((lane & 3) == 0) {
+        sFactor[stripe * QL + smRow] = factor;
+      }
+#pragma unroll
+      for (int j = 0; j < BK / 4; ++j) {
+        sPMine[smRow * BK + smCol + j] = (T)sv[j];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage the value block over the consumed key staging, same 16-byte
+    // lines.
+    for (int i = tix; i < BK * V4R; i += nthreads) {
+      const int n = i / V4R;
+      const int c4 = i % V4R;
+      uint4 val = uint4(0);
+      if (n0 + n < N) {
+        val = *((const device uint4*)(vHead + (size_t)(n0 + n) * v_seq_stride) + c4);
+      }
+      sKV4[i] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Rescale the O accumulators by this block's factor (per C-fragment
+    // row, crossed over via sFactor), then accumulate P.V.
+    const float oFactor = sFactor[stripe * QL + fragRow];
+    simdgroup_matrix<T, 8, 8> Pf[BK / 8];
+#pragma unroll
+    for (int c = 0; c < BK / 8; ++c) {
+      simdgroup_load(Pf[c], sPMine, (ulong)BK, ulong2((ulong)(c * 8), 0));
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) {
+      O[t].thread_elements()[0] *= oFactor;
+      O[t].thread_elements()[1] *= oFactor;
+      for (int c = 0; c < BK / 8; ++c) {
+        simdgroup_matrix<T, 8, 8> Vf;
+        simdgroup_load(
+            Vf, sKV, (ulong)D,
+            ulong2((ulong)(dhalf * H2 + t * 8), (ulong)(c * 8)));
+        simdgroup_multiply_accumulate(O[t], Pf[c], Vf, O[t]);
+      }
+    }
+    // sS/sP/sKV are rewritten next block behind this barrier; the factor
+    // slot is consumed above.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Unnormalized partials + per-row exp-sums and maxes, exactly the
+  // contract sdpa_vector_2pass_2 merges.
+  const int row0 = q_batch_head_idx * q_seq_len;
+  device T* pOut = out + ((size_t)row0 * blocks + part_idx) * D;
+  // Rows beyond the real q_seq_len are padding (host pads q to 8 rows for
+  // qL < 8): stage each O tile per-simdgroup and copy only real rows out.
+  // At qL = 8 every row copies — bitwise the simdgroup_store this replaces.
+  threadgroup T* oStage = (threadgroup T*)sSMine; // free after the last barrier
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    simdgroup_matrix<T, 8, 8> Ot;
+    Ot.thread_elements()[0] = (T)O[t].thread_elements()[0];
+    Ot.thread_elements()[1] = (T)O[t].thread_elements()[1];
+    simdgroup_store(Ot, oStage, (ulong)8, ulong2(0, 0));
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      const int r = (int)lane >> 2;      // 8 rows x 4 lanes: 2 cols per lane
+      const int c = ((int)lane & 3) * 2;
+      if (r < q_seq_len) {
+        pOut[(size_t)r * blocks * D + dhalf * H2 + t * 8 + c] =
+            oStage[r * 8 + c];
+        pOut[(size_t)r * blocks * D + dhalf * H2 + t * 8 + c + 1] =
+            oStage[r * 8 + c + 1];
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (dhalf == 0 && (lane & 3) == 0 && smRow < q_seq_len) {
+    sums[(row0 + smRow) * blocks + part_idx] = lRun;
+    maxs[(row0 + smRow) * blocks + part_idx] = mRun;
+  }
+}
+
 template <typename T, int D>
 [[kernel]] void sdpa_vector_2pass_2(
     const device T* partials [[buffer(0)]],

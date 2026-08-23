@@ -44,6 +44,18 @@ using namespace metal;
   instantiate_sdpa_vector_aggregation(type, 128) \
   instantiate_sdpa_vector_aggregation(type, 256)
 
+#define instantiate_sdpa_vector_2pass_1_mma(type, qk_dim, value_dim) \
+  instantiate_kernel(                                                 \
+      "sdpa_vector_2pass_1_mma_" #type "_" #qk_dim "_" #value_dim,    \
+      sdpa_vector_2pass_1_mma,                                        \
+      type,                                                           \
+      qk_dim)
+
+// 2-byte types only: the ragged-tail staging alone is 16 KB at
+// sizeof(T) == 2 (host dispatch gates the same way).
+instantiate_sdpa_vector_2pass_1_mma(bfloat16_t, 256, 256)
+instantiate_sdpa_vector_2pass_1_mma(float16_t, 256, 256)
+
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)

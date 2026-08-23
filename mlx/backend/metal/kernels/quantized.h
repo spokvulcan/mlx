@@ -2680,7 +2680,7 @@ template <typename T, const int group_size, const int bits>
 //    uint32s.
 //  - bits == 8 (staged): dequant into a per-simdgroup threadgroup tile with
 //    a software-pipelined register prefetch behind the MMA chain.
-// Dispatched for 5 <= M <= 8, group_size 64, bits 4/8, N >= 4096, K % 512 == 0,
+// Dispatched for 5 <= M <= 8, group_size 64, bits 4/8, N >= 2048, K % 512 == 0,
 // non-batched, bf16 activations. fp32 accumulation. Port of avlp12's qmm_mma4
 // (MIT), via jundot/omlx's small_m_qmm.py; the direct-fragment path is ours.
 template <typename T, int group_size, int bits>
@@ -2865,6 +2865,463 @@ template <typename T, int group_size, int bits>
 #pragma unroll
       for (int q = 0; q < 8; ++q) {
         v += red[q * 64 + i];
+      }
+      y[(size_t)m * N + n] = (T)v;
+    }
+  }
+}
+
+// Small-M affine QMM, 16-wide-N variant of affine_qmm_mma8: one threadgroup
+// covers TWO adjacent 8-column tiles that share the A fragments, so each
+// 64-k step loads A once, streams four weight columns per lane, and issues
+// two MMAs — twice the independent loads in flight per lane (this family is
+// latency-bound, not bandwidth-bound) for half the threadgroups and half the
+// per-output A traffic and address math. 4-bit direct-fragment only. Rows
+// >= M clamp onto row M-1 and their results are never stored. Same dispatch
+// window as affine_qmm_mma8 (gated behind MLX_QMM_MMA8_N16 for A/B). fp32
+// accumulation, split-K over 8 simdgroups — the accumulation order per
+// output matches affine_qmm_mma8's.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmm_mma8n16(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  static_assert(
+      group_size == 64, "affine_qmm_mma8n16 stages one quantization group");
+  static_assert(bits == 4, "affine_qmm_mma8n16 is 4-bit direct-fragment only");
+  constexpr int pack = 32 / bits; // values per packed uint32
+
+  const int KPS = K / 8; // K-span per simdgroup (split-K over 8 simdgroups)
+  const uint sg = tid >> 5;
+  const uint lane = tid & 31;
+  const int n0 = (int)tgid.x * 16; // one threadgroup -> 16 output columns
+
+  threadgroup float red[8 * 128]; // cross-simdgroup reduction, two n tiles
+
+  simdgroup_matrix<float, 8, 8> C0(0);
+  simdgroup_matrix<float, 8, 8> C1(0);
+
+  const int kg = K / group_size; // scale/bias row stride
+  const int kw = K / pack; // packed-weight row stride (uint32s)
+  const uint32_t qmask = (1u << bits) - 1;
+
+  // Lane fragment mapping: see affine_qmm_mma8. C0 carries columns
+  // n0..n0+7, C1 columns n0+8..n0+15; both share the A fragment.
+  const int qid = (int)(lane >> 2);
+  const int fragRow = (qid & 4) + (int)((lane >> 1) & 3);
+  const int am = min(fragRow, M - 1);
+  const int acol = ((qid & 2) << 1) + ((int)(lane & 1) << 1);
+  const device T* arow = x + (size_t)am * K;
+
+  const int kbeg = (int)sg * KPS;
+
+  const int nA = n0 + acol;
+  const int nC = nA + 8;
+  const bool aValid = nA < N;
+  const bool bValid = nA + 1 < N;
+  const bool cValid = nC < N;
+  const bool dValid = nC + 1 < N;
+  const device uint32_t* wa = w + (size_t)nA * kw;
+  const device uint32_t* wb = wa + kw;
+  const device uint32_t* wc = w + (size_t)nC * kw;
+  const device uint32_t* wd = wc + kw;
+  const device T* sa = scales + (size_t)nA * kg;
+  const device T* sb = sa + kg;
+  const device T* sc = scales + (size_t)nC * kg;
+  const device T* sd = sc + kg;
+  const device T* ba = biases + (size_t)nA * kg;
+  const device T* bb = ba + kg;
+  const device T* bc = biases + (size_t)nC * kg;
+  const device T* bd = bc + kg;
+  const uint sh = (uint)(fragRow * bits);
+
+  for (int kk = 0; kk < KPS; kk += 64) {
+    const int ka = kbeg + kk;
+    const int g = ka >> 6; // quantization group index
+    const int woff = ka / pack; // 64 values = 8 uint32 at 4-bit
+    uint32_t pa[8] = {0}, pb[8] = {0}, pc[8] = {0}, pd[8] = {0}, ax[8];
+    float s0 = 0, b0 = 0, s1 = 0, b1 = 0, s2 = 0, b2 = 0, s3 = 0, b3 = 0;
+    if (aValid) {
+      s0 = (float)sa[g];
+      b0 = (float)ba[g];
+      *(thread uint4*)(pa) = *((const device uint4*)(wa + woff));
+      *(thread uint4*)(pa + 4) = *((const device uint4*)(wa + woff) + 1);
+    }
+    if (bValid) {
+      s1 = (float)sb[g];
+      b1 = (float)bb[g];
+      *(thread uint4*)(pb) = *((const device uint4*)(wb + woff));
+      *(thread uint4*)(pb + 4) = *((const device uint4*)(wb + woff) + 1);
+    }
+    if (cValid) {
+      s2 = (float)sc[g];
+      b2 = (float)bc[g];
+      *(thread uint4*)(pc) = *((const device uint4*)(wc + woff));
+      *(thread uint4*)(pc + 4) = *((const device uint4*)(wc + woff) + 1);
+    }
+    if (dValid) {
+      s3 = (float)sd[g];
+      b3 = (float)bd[g];
+      *(thread uint4*)(pd) = *((const device uint4*)(wd + woff));
+      *(thread uint4*)(pd + 4) = *((const device uint4*)(wd + woff) + 1);
+    }
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      ax[kt] = *(const device uint32_t*)(arow + ka + kt * 8 + acol);
+    }
+    simdgroup_matrix<T, 8, 8> A, B0, B1;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      A.thread_elements()[0] = as_type<T>((ushort)(ax[kt] & 0xffffu));
+      A.thread_elements()[1] = as_type<T>((ushort)(ax[kt] >> 16));
+      B0.thread_elements()[0] = (T)((float)((pa[kt] >> sh) & qmask) * s0 + b0);
+      B0.thread_elements()[1] = (T)((float)((pb[kt] >> sh) & qmask) * s1 + b1);
+      B1.thread_elements()[0] = (T)((float)((pc[kt] >> sh) & qmask) * s2 + b2);
+      B1.thread_elements()[1] = (T)((float)((pd[kt] >> sh) & qmask) * s3 + b3);
+      simdgroup_multiply_accumulate(C0, A, B0, C0);
+      simdgroup_multiply_accumulate(C1, A, B1, C1);
+    }
+  }
+
+  simdgroup_store(C0, red + sg * 128, 8);
+  simdgroup_store(C1, red + sg * 128 + 64, 8);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Sum the 8 split-K partials and write out (columns n0..n0+7 from the
+  // first 64 slots per simdgroup, n0+8..n0+15 from the second).
+  for (int i = (int)tid; i < 128; i += 256) {
+    const int t = i >> 6; // n tile
+    const int m = (i & 63) >> 3;
+    const int j = (i & 7) + (t << 3);
+    const int n = n0 + j;
+    if (m < M && n < N) {
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        v += red[q * 128 + i];
+      }
+      y[(size_t)m * N + n] = (T)v;
+    }
+  }
+}
+
+// Small-M affine QMM, 32-wide-N variant of affine_qmm_mma8n16: one
+// threadgroup covers FOUR adjacent 8-column tiles sharing the A fragments —
+// eight weight streams per lane and four MMAs per 64-k step, quadrupling
+// the independent loads in flight (latency-bound family) for a quarter of
+// the threadgroups. Register-heavy by design: whether the extra ILP beats
+// the occupancy loss is decided by the census A/B (opt-in via
+// MLX_QMM_MMA8_N32). 4-bit direct-fragment only; rows >= M clamp onto row
+// M-1 and are never stored. fp32 accumulation, split-K over 8 simdgroups —
+// the accumulation order per output matches affine_qmm_mma8's.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmm_mma8n32(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  static_assert(
+      group_size == 64, "affine_qmm_mma8n32 stages one quantization group");
+  static_assert(bits == 4, "affine_qmm_mma8n32 is 4-bit direct-fragment only");
+  constexpr int pack = 32 / bits; // values per packed uint32
+
+  const int KPS = K / 8; // K-span per simdgroup (split-K over 8 simdgroups)
+  const uint sg = tid >> 5;
+  const uint lane = tid & 31;
+  const int n0 = (int)tgid.x * 32; // one threadgroup -> 32 output columns
+
+  threadgroup float red[8 * 256]; // cross-simdgroup reduction, four n tiles
+
+  simdgroup_matrix<float, 8, 8> C0(0);
+  simdgroup_matrix<float, 8, 8> C1(0);
+  simdgroup_matrix<float, 8, 8> C2(0);
+  simdgroup_matrix<float, 8, 8> C3(0);
+
+  const int kg = K / group_size; // scale/bias row stride
+  const int kw = K / pack; // packed-weight row stride (uint32s)
+  const uint32_t qmask = (1u << bits) - 1;
+
+  // Lane fragment mapping: see affine_qmm_mma8. C0 carries columns
+  // n0..n0+7, C1 +8, C2 +16, C3 +24; all share the A fragment.
+  const int qid = (int)(lane >> 2);
+  const int fragRow = (qid & 4) + (int)((lane >> 1) & 3);
+  const int am = min(fragRow, M - 1);
+  const int acol = ((qid & 2) << 1) + (int)((lane & 1) << 1);
+  const device T* arow = x + (size_t)am * K;
+
+  const int kbeg = (int)sg * KPS;
+
+  const int nA = n0 + acol;
+  const int nC = nA + 8;
+  const int nE = nA + 16;
+  const int nG = nA + 24;
+  const bool aValid = nA < N;
+  const bool bValid = nA + 1 < N;
+  const bool cValid = nC < N;
+  const bool dValid = nC + 1 < N;
+  const bool eValid = nE < N;
+  const bool fValid = nE + 1 < N;
+  const bool gValid = nG < N;
+  const bool hValid = nG + 1 < N;
+  const device uint32_t* wa = w + (size_t)nA * kw;
+  const device uint32_t* wb = wa + kw;
+  const device uint32_t* wc = w + (size_t)nC * kw;
+  const device uint32_t* wd = wc + kw;
+  const device uint32_t* we = w + (size_t)nE * kw;
+  const device uint32_t* wf = we + kw;
+  const device uint32_t* wg = w + (size_t)nG * kw;
+  const device uint32_t* wh = wg + kw;
+  const device T* sa = scales + (size_t)nA * kg;
+  const device T* sb = sa + kg;
+  const device T* sc = scales + (size_t)nC * kg;
+  const device T* sd = sc + kg;
+  const device T* ses = scales + (size_t)nE * kg;
+  const device T* sfs = ses + kg;
+  const device T* sgs = scales + (size_t)nG * kg;
+  const device T* shs = sgs + kg;
+  const device T* ba = biases + (size_t)nA * kg;
+  const device T* bb = ba + kg;
+  const device T* bc = biases + (size_t)nC * kg;
+  const device T* bd = bc + kg;
+  const device T* bes = biases + (size_t)nE * kg;
+  const device T* bfs = bes + kg;
+  const device T* bgs = biases + (size_t)nG * kg;
+  const device T* bhs = bgs + kg;
+  const uint sh = (uint)(fragRow * bits);
+
+  for (int kk = 0; kk < KPS; kk += 64) {
+    const int ka = kbeg + kk;
+    const int g = ka >> 6; // quantization group index
+    const int woff = ka / pack; // 64 values = 8 uint32 at 4-bit
+    uint32_t pa[8] = {0}, pb[8] = {0}, pc[8] = {0}, pd[8] = {0};
+    uint32_t pe[8] = {0}, pf[8] = {0}, pg[8] = {0}, ph[8] = {0};
+    uint32_t ax[8];
+    float s0 = 0, b0 = 0, s1 = 0, b1 = 0, s2 = 0, b2 = 0, s3 = 0, b3 = 0;
+    float s4 = 0, b4 = 0, s5 = 0, b5 = 0, s6 = 0, b6 = 0, s7 = 0, b7 = 0;
+    if (aValid) {
+      s0 = (float)sa[g];
+      b0 = (float)ba[g];
+      *(thread uint4*)(pa) = *((const device uint4*)(wa + woff));
+      *(thread uint4*)(pa + 4) = *((const device uint4*)(wa + woff) + 1);
+    }
+    if (bValid) {
+      s1 = (float)sb[g];
+      b1 = (float)bb[g];
+      *(thread uint4*)(pb) = *((const device uint4*)(wb + woff));
+      *(thread uint4*)(pb + 4) = *((const device uint4*)(wb + woff) + 1);
+    }
+    if (cValid) {
+      s2 = (float)sc[g];
+      b2 = (float)bc[g];
+      *(thread uint4*)(pc) = *((const device uint4*)(wc + woff));
+      *(thread uint4*)(pc + 4) = *((const device uint4*)(wc + woff) + 1);
+    }
+    if (dValid) {
+      s3 = (float)sd[g];
+      b3 = (float)bd[g];
+      *(thread uint4*)(pd) = *((const device uint4*)(wd + woff));
+      *(thread uint4*)(pd + 4) = *((const device uint4*)(wd + woff) + 1);
+    }
+    if (eValid) {
+      s4 = (float)ses[g];
+      b4 = (float)bes[g];
+      *(thread uint4*)(pe) = *((const device uint4*)(we + woff));
+      *(thread uint4*)(pe + 4) = *((const device uint4*)(we + woff) + 1);
+    }
+    if (fValid) {
+      s5 = (float)sfs[g];
+      b5 = (float)bfs[g];
+      *(thread uint4*)(pf) = *((const device uint4*)(wf + woff));
+      *(thread uint4*)(pf + 4) = *((const device uint4*)(wf + woff) + 1);
+    }
+    if (gValid) {
+      s6 = (float)sgs[g];
+      b6 = (float)bgs[g];
+      *(thread uint4*)(pg) = *((const device uint4*)(wg + woff));
+      *(thread uint4*)(pg + 4) = *((const device uint4*)(wg + woff) + 1);
+    }
+    if (hValid) {
+      s7 = (float)shs[g];
+      b7 = (float)bhs[g];
+      *(thread uint4*)(ph) = *((const device uint4*)(wh + woff));
+      *(thread uint4*)(ph + 4) = *((const device uint4*)(wh + woff) + 1);
+    }
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      ax[kt] = *(const device uint32_t*)(arow + ka + kt * 8 + acol);
+    }
+    simdgroup_matrix<T, 8, 8> A, B0, B1, B2, B3;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      A.thread_elements()[0] = as_type<T>((ushort)(ax[kt] & 0xffffu));
+      A.thread_elements()[1] = as_type<T>((ushort)(ax[kt] >> 16));
+      B0.thread_elements()[0] = (T)((float)((pa[kt] >> sh) & qmask) * s0 + b0);
+      B0.thread_elements()[1] = (T)((float)((pb[kt] >> sh) & qmask) * s1 + b1);
+      B1.thread_elements()[0] = (T)((float)((pc[kt] >> sh) & qmask) * s2 + b2);
+      B1.thread_elements()[1] = (T)((float)((pd[kt] >> sh) & qmask) * s3 + b3);
+      B2.thread_elements()[0] = (T)((float)((pe[kt] >> sh) & qmask) * s4 + b4);
+      B2.thread_elements()[1] = (T)((float)((pf[kt] >> sh) & qmask) * s5 + b5);
+      B3.thread_elements()[0] = (T)((float)((pg[kt] >> sh) & qmask) * s6 + b6);
+      B3.thread_elements()[1] = (T)((float)((ph[kt] >> sh) & qmask) * s7 + b7);
+      simdgroup_multiply_accumulate(C0, A, B0, C0);
+      simdgroup_multiply_accumulate(C1, A, B1, C1);
+      simdgroup_multiply_accumulate(C2, A, B2, C2);
+      simdgroup_multiply_accumulate(C3, A, B3, C3);
+    }
+  }
+
+  simdgroup_store(C0, red + sg * 256, 8);
+  simdgroup_store(C1, red + sg * 256 + 64, 8);
+  simdgroup_store(C2, red + sg * 256 + 128, 8);
+  simdgroup_store(C3, red + sg * 256 + 192, 8);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Sum the 8 split-K partials and write out (tile t covers columns
+  // n0 + t*8 .. n0 + t*8 + 7).
+  for (int i = (int)tid; i < 256; i += 256) {
+    const int t = i >> 6; // n tile
+    const int m = (i & 63) >> 3;
+    const int j = (i & 7) + (t << 3);
+    const int n = n0 + j;
+    if (m < M && n < N) {
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        v += red[q * 256 + i];
+      }
+      y[(size_t)m * N + n] = (T)v;
+    }
+  }
+}
+
+// Small-M affine QMM, 16-row variant of affine_qmm_mma8: two stacked 8x8 A
+// fragments (rows 0-7 and 8-15) share each dequantized B fragment, so the
+// weight stream still runs ONCE and amortizes over up to 16 rows for one
+// extra accumulator, A load, and MMA per step. 4-bit direct-fragment only
+// (the speculative verify/draft path this serves is 4-bit); 8-bit and other
+// modes keep their existing routes. Rows >= M clamp onto row M-1 and their
+// results are never stored. Dispatched for 9 <= M <= 16, group_size 64,
+// bits 4, N >= 4096, K % 512 == 0, non-batched, bf16 activations. fp32
+// accumulation, split-K over 8 simdgroups — the accumulation order per
+// output matches affine_qmm_mma8's class.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmm_mma16(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  static_assert(
+      group_size == 64, "affine_qmm_mma16 stages one quantization group");
+  static_assert(bits == 4, "affine_qmm_mma16 is 4-bit direct-fragment only");
+  constexpr int pack = 32 / bits; // values per packed uint32
+
+  const int KPS = K / 8; // K-span per simdgroup (split-K over 8 simdgroups)
+  const uint sg = tid >> 5;
+  const uint lane = tid & 31;
+  const int n0 = (int)tgid.x * 8; // one threadgroup -> 8 output columns
+
+  threadgroup float red[8 * 128]; // cross-simdgroup reduction, 16 rows
+
+  simdgroup_matrix<float, 8, 8> C0(0);
+  simdgroup_matrix<float, 8, 8> C1(0);
+
+  const int kg = K / group_size; // scale/bias row stride
+  const int kw = K / pack; // packed-weight row stride (uint32s)
+  const uint32_t qmask = (1u << bits) - 1;
+
+  // Lane fragment mapping: see affine_qmm_mma8. A0 carries rows 0-7, A1
+  // rows 8-15; both clamp onto row M-1 so the reads stay in bounds.
+  const int qid = (int)(lane >> 2);
+  const int fragRow = (qid & 4) + (int)((lane >> 1) & 3);
+  const int am0 = min(fragRow, M - 1);
+  const int am1 = min(8 + fragRow, M - 1);
+  const int acol = ((qid & 2) << 1) + ((int)(lane & 1) << 1);
+  const device T* arow0 = x + (size_t)am0 * K;
+  const device T* arow1 = x + (size_t)am1 * K;
+
+  const int kbeg = (int)sg * KPS;
+
+  const int nA = n0 + acol;
+  const bool aValid = nA < N;
+  const bool bValid = nA + 1 < N;
+  const device uint32_t* wa = w + (size_t)nA * kw;
+  const device uint32_t* wb = wa + kw;
+  const device T* sa = scales + (size_t)nA * kg;
+  const device T* sb = sa + kg;
+  const device T* ba = biases + (size_t)nA * kg;
+  const device T* bb = ba + kg;
+  const uint sh = (uint)(fragRow * bits);
+
+  for (int kk = 0; kk < KPS; kk += 64) {
+    const int ka = kbeg + kk;
+    const int g = ka >> 6; // quantization group index
+    const int woff = ka / pack; // 64 values = 8 uint32 at 4-bit
+    uint32_t pa[8] = {0}, pb[8] = {0}, ax0[8], ax1[8];
+    float s0 = 0, b0 = 0, s1 = 0, b1 = 0;
+    if (aValid) {
+      s0 = (float)sa[g];
+      b0 = (float)ba[g];
+      *(thread uint4*)(pa) = *((const device uint4*)(wa + woff));
+      *(thread uint4*)(pa + 4) = *((const device uint4*)(wa + woff) + 1);
+    }
+    if (bValid) {
+      s1 = (float)sb[g];
+      b1 = (float)bb[g];
+      *(thread uint4*)(pb) = *((const device uint4*)(wb + woff));
+      *(thread uint4*)(pb + 4) = *((const device uint4*)(wb + woff) + 1);
+    }
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      ax0[kt] = *(const device uint32_t*)(arow0 + ka + kt * 8 + acol);
+      ax1[kt] = *(const device uint32_t*)(arow1 + ka + kt * 8 + acol);
+    }
+    simdgroup_matrix<T, 8, 8> A0, A1, B;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      A0.thread_elements()[0] = as_type<T>((ushort)(ax0[kt] & 0xffffu));
+      A0.thread_elements()[1] = as_type<T>((ushort)(ax0[kt] >> 16));
+      A1.thread_elements()[0] = as_type<T>((ushort)(ax1[kt] & 0xffffu));
+      A1.thread_elements()[1] = as_type<T>((ushort)(ax1[kt] >> 16));
+      B.thread_elements()[0] = (T)((float)((pa[kt] >> sh) & qmask) * s0 + b0);
+      B.thread_elements()[1] = (T)((float)((pb[kt] >> sh) & qmask) * s1 + b1);
+      simdgroup_multiply_accumulate(C0, A0, B, C0);
+      simdgroup_multiply_accumulate(C1, A1, B, C1);
+    }
+  }
+
+  simdgroup_store(C0, red + sg * 128, 8);
+  simdgroup_store(C1, red + sg * 128 + 64, 8);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Sum the 8 split-K partials and write out (rows 0-7 then 8-15).
+  for (int i = (int)tid; i < 128; i += 256) {
+    const int m = i >> 3;
+    const int j = i & 7;
+    const int n = n0 + j;
+    if (m < M && n < N) {
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        v += red[q * 128 + i];
       }
       y[(size_t)m * N + n] = (T)v;
     }
