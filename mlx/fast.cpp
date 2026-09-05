@@ -858,7 +858,11 @@ array scaled_dot_product_attention(
                    has_sinks,
                    has_arr_mask,
                    s](const std::vector<array>& inputs) {
-    auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+    // tesseract: a unit scale is an identity (x * 1 is exact), skip its
+    // launch.
+    auto q = scale == 1.0f
+        ? inputs[0]
+        : multiply(array(scale, inputs[0].dtype()), inputs[0], s);
     int n_repeats = n_q_heads / n_kv_heads;
     auto k = inputs[1];
     auto v = inputs[2];

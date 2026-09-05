@@ -337,6 +337,20 @@ void sdpa_vector(
     bool do_causal,
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
+  // Compute the necessary sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
+
+  bool has_mask = mask.has_value();
+  bool bool_mask = has_mask && (*mask).dtype() == bool_;
+  bool float_mask = has_mask && !bool_mask;
+  bool query_transposed = !q.flags().row_contiguous;
+  bool has_sinks = sinks.has_value();
+
   // Set the kernel name
   std::string kname;
   kname.reserve(64);
@@ -347,22 +361,9 @@ void sdpa_vector(
   kname += "_";
   kname += std::to_string(v.shape(-1));
 
-  // Compute the necessary sizes
-  int gqa_factor = q.shape(1) / k.shape(1);
-  int N = k.shape(2);
-  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
-  size_t k_seq_stride = k.strides()[2];
-  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
-  size_t v_seq_stride = v.strides()[2];
-
   MTL::Size group_dims(1024, 1, 1);
   MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
 
-  bool has_mask = mask.has_value();
-  bool bool_mask = has_mask && (*mask).dtype() == bool_;
-  bool float_mask = has_mask && !bool_mask;
-  bool query_transposed = !q.flags().row_contiguous;
-  bool has_sinks = sinks.has_value();
   metal::MTLFCList func_consts = {
       {&has_mask, MTL::DataType::DataTypeBool, 20},
       {&query_transposed, MTL::DataType::DataTypeBool, 21},
@@ -534,17 +535,19 @@ void sdpa_vector_2pass(
   }
   if (use_mma) {
     // One threadgroup per (KV head, batch, partition): (lanes, D-half,
-    // q-head stripe). Contiguous partitions; 64 keeps the merge kernel's
-    // 32-block loop whole and the grid past the core count.
-    // 256 partitions: the verify runs its 16 SDPAs serially between
-    // dependent segments, so the kernel must fill the machine alone —
-    // 1024 threadgroups beat 256 live (64 only wins when independent
-    // ops overlap, the probe's concurrent regime).
-    static const int mma_blocks = []() {
+    // q-head stripe). Contiguous partitions. Measured per SDPA on the
+    // verify shape (q [1, 24, 8, 256], one SDPA per command buffer, the
+    // regime the verify's serial attention layers run in): 64 partitions
+    // beat 256 at every length from 1K to 16K keys (127 vs 306 us at 1K,
+    // 294 vs 415 at 6K, 683 vs 806 at 16K) and tie 128 at 32K; 32 wins
+    // only below 2K keys. The partition count changes the merge order, so
+    // it is not numerics-neutral across settings. MLX_SDPA_MMA_BLOCKS
+    // overrides.
+    static const int mma_blocks_override = []() {
       const char* v = getenv("MLX_SDPA_MMA_BLOCKS");
-      return v != nullptr ? atoi(v) : 256;
+      return v != nullptr ? atoi(v) : 0;
     }();
-    blocks = mma_blocks;
+    blocks = mma_blocks_override > 0 ? mma_blocks_override : (N < 2048 ? 32 : 64);
     num_q_chunks = 1;
     z_ext = gqa_factor;
   }
@@ -726,18 +729,16 @@ bool ScaledDotProductAttention::use_fallback(
   const bool supports_sdpa_full = query_sequence_length > 8 &&
       sdpa_full_supported_mask && sdpa_full_supported_head_dim;
 
-  // qL * gqa > 32 overflows the 1024-thread (32-lane x gqa x qL) threadgroup
-  // of the vector kernels. The 2-pass path tiles the query axis across
-  // grid.y (see sdpa_vector_2pass), so it serves any qL <= 8 with
-  // gqa <= 32; the 1-pass kernel keeps the 32-simdgroup cap.
-  char devc = metal::device(s.device).get_architecture().back();
-  const bool two_pass_serves = gqa_factor <= 32 &&
-      (((devc == 'd' || devc == 's') && key_sequence_length >= 1024) ||
-       (num_kv_heads < num_query_heads && key_sequence_length >= 4096));
+  // The vector kernels serve any qL <= 8 with gqa <= 32: the 1-pass kernel's
+  // threadgroups are per (head, query) row, and the 2-pass kernel (eval_gpu's
+  // pick past 1024 keys) tiles qL * gqa > 32 across grid.y, see
+  // sdpa_vector_2pass. Measured on the DFlash2 verify shape (q [1, 24, 8,
+  // 256], gqa 6) below 1024 keys: one 1-pass launch of 27-67 us at 64-512
+  // keys against the unfused chain's seven launches at 45-108 us, and the
+  // block's logits then come from the kernel the single-token decode uses.
   const bool supports_sdpa_vector = (query_sequence_length <= 8) &&
       (query_sequence_length <= key_sequence_length) &&
-      sdpa_vector_supported_head_dim &&
-      ((query_sequence_length * gqa_factor) <= 32 || two_pass_serves);
+      sdpa_vector_supported_head_dim && gqa_factor <= 32;
 
   return !(supports_sdpa_full || supports_sdpa_vector);
 }
