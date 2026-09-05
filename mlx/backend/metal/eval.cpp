@@ -6,8 +6,75 @@
 #include "mlx/backend/metal/utils.h"
 #include "mlx/primitives.h"
 #include "mlx/scheduler.h"
+#include "mlx/utils.h"
+
+#include <cstdlib>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <string>
 
 namespace mlx::core::gpu {
+
+// Tesseract diagnostic: MLX_KERNEL_PROFILE=1 serializes every primitive
+// into its own command buffer and accumulates GPU time (GPUEndTime -
+// GPUStartTime) by "<window> <primitive> <shapes>" key, windowed by the
+// value of MLX_KERNEL_PROFILE_ACTIVE (unset = not recorded). Dumped to
+// stderr at exit. Perturbs wall time heavily; GPU per-kernel time is the
+// signal. Never enable in production.
+namespace {
+struct KernelProfileEntry {
+  long count = 0;
+  double gpu_seconds = 0;
+};
+std::mutex g_kernel_profile_mutex;
+std::map<std::string, KernelProfileEntry>* g_kernel_profile = nullptr;
+
+void kernel_profile_dump() {
+  std::lock_guard<std::mutex> lock(g_kernel_profile_mutex);
+  if (g_kernel_profile == nullptr) {
+    return;
+  }
+  double total = 0;
+  long n = 0;
+  for (auto& kv : *g_kernel_profile) {
+    total += kv.second.gpu_seconds;
+    n += kv.second.count;
+  }
+  fprintf(stderr, "[kernel-profile] total_ms=%.3f count=%ld\n", total * 1e3, n);
+  for (auto& kv : *g_kernel_profile) {
+    fprintf(
+        stderr,
+        "[kernel-profile] %.4f %ld %s\n",
+        kv.second.gpu_seconds * 1e3,
+        kv.second.count,
+        kv.first.c_str());
+  }
+}
+
+bool kernel_profile_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_KERNEL_PROFILE");
+    if (env != nullptr && env[0] == '1') {
+      std::atexit(kernel_profile_dump);
+      return true;
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+std::string kernel_profile_shape(const array& a) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < a.shape().size(); ++i) {
+    if (i) os << ",";
+    os << a.shape(i);
+  }
+  os << "]";
+  return os.str();
+}
+} // namespace
 
 void new_stream(Stream stream) {
   if (stream.device == mlx::core::Device::gpu) {
@@ -57,6 +124,43 @@ void eval(array& arr) {
     auto p = sb.data_shared_ptr();
     if (p != out_data) {
       d.retain_until_commit(s.index, std::move(p));
+    }
+  }
+
+  if (kernel_profile_enabled()) {
+    const char* active = std::getenv("MLX_KERNEL_PROFILE_ACTIVE");
+    if (active != nullptr && active[0] != '\0') {
+      std::string key = active;
+      key += " ";
+      key += arr.primitive().name();
+      key += " out" + kernel_profile_shape(arr);
+      {
+        std::ostringstream os;
+        os << arr.dtype();
+        key += " " + os.str();
+      }
+      int shown = 0;
+      for (auto& in : arr.inputs()) {
+        if (shown++ == 3) break;
+        key += " in" + kernel_profile_shape(in);
+      }
+      d.end_encoding(s.index);
+      auto cb = d.get_command_buffer(s.index);
+      cb->retain();
+      d.commit_command_buffer(s.index);
+      cb->waitUntilCompleted();
+      double gpu = cb->GPUEndTime() - cb->GPUStartTime();
+      check_error(cb);
+      cb->release();
+      d.get_command_buffer(s.index);
+      std::lock_guard<std::mutex> lock(g_kernel_profile_mutex);
+      if (g_kernel_profile == nullptr) {
+        g_kernel_profile = new std::map<std::string, KernelProfileEntry>();
+      }
+      auto& e = (*g_kernel_profile)[key];
+      e.count += 1;
+      e.gpu_seconds += gpu;
+      return;
     }
   }
 

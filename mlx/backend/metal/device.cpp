@@ -8,6 +8,11 @@
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
+
 #include "mlx/backend/common/utils.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/metal.h"
@@ -451,6 +456,124 @@ bool Device::command_buffer_needs_commit(int index) {
        (stream.buffer_output_sizes >> 20) > max_mb_output_per_buffer_);
 }
 
+
+// Tesseract diagnostic: MLX_CB_PROFILE=1 records every command buffer's GPU
+// interval (GPUStartTime..GPUEndTime) under the MLX_KERNEL_PROFILE_ACTIVE
+// window and dumps busy / span / gap totals at exit. Cheap enough to leave
+// batching intact (one handler per command buffer). Never enable in
+// production.
+namespace {
+struct CbProfileEntry {
+  double busy = 0;
+  double first = 1e300;
+  double last = 0;
+  double gaps = 0;
+  double prev_end = 0;
+  long count = 0;
+};
+std::mutex g_cb_profile_mutex;
+std::map<std::string, CbProfileEntry>* g_cb_profile = nullptr;
+// MLX_CB_TRACE=1: also keep every buffer's interval for a per-buffer dump.
+struct CbTraceEntry {
+  std::string key;
+  double start;
+  double end;
+};
+std::vector<CbTraceEntry>* g_cb_trace = nullptr;
+bool g_cb_trace_enabled = false;
+
+void cb_profile_dump() {
+  std::lock_guard<std::mutex> lock(g_cb_profile_mutex);
+  if (g_cb_profile == nullptr) {
+    return;
+  }
+  for (auto& kv : *g_cb_profile) {
+    const auto& e = kv.second;
+    fprintf(
+        stderr,
+        "[cb-profile] %s busy_ms=%.3f span_ms=%.3f gaps_ms=%.3f buffers=%ld\n",
+        kv.first.c_str(),
+        e.busy * 1e3,
+        (e.last - e.first) * 1e3,
+        e.gaps * 1e3,
+        e.count);
+  }
+  if (g_cb_trace != nullptr) {
+    double origin = -1;
+    double prev_end = 0;
+    long i = 0;
+    for (auto& t : *g_cb_trace) {
+      if (origin < 0) {
+        origin = t.start;
+      }
+      const double gap = (prev_end > 0 && t.start > prev_end) ? t.start - prev_end : 0;
+      fprintf(
+          stderr,
+          "[cb-trace] %s %ld start_ms=%.3f dur_us=%.1f gap_us=%.1f\n",
+          t.key.c_str(),
+          i++,
+          (t.start - origin) * 1e3,
+          (t.end - t.start) * 1e6,
+          gap * 1e6);
+      if (t.end > prev_end) {
+        prev_end = t.end;
+      }
+    }
+  }
+}
+
+bool cb_profile_enabled() {
+  static const bool enabled = []() {
+    const char* env = std::getenv("MLX_CB_PROFILE");
+    if (env != nullptr && env[0] == '1') {
+      std::atexit(cb_profile_dump);
+      const char* trace = std::getenv("MLX_CB_TRACE");
+      g_cb_trace_enabled = trace != nullptr && trace[0] == '1';
+      return true;
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+void cb_profile_attach(MTL::CommandBuffer* buffer) {
+  const char* active = std::getenv("MLX_KERNEL_PROFILE_ACTIVE");
+  if (active == nullptr || active[0] == '\0') {
+    return;
+  }
+  std::string key = active;
+  buffer->addCompletedHandler([key](MTL::CommandBuffer* cbuf) {
+    const double s = cbuf->GPUStartTime();
+    const double e = cbuf->GPUEndTime();
+    std::lock_guard<std::mutex> lock(g_cb_profile_mutex);
+    if (g_cb_profile == nullptr) {
+      g_cb_profile = new std::map<std::string, CbProfileEntry>();
+    }
+    auto& en = (*g_cb_profile)[key];
+    en.busy += e - s;
+    en.count += 1;
+    if (s < en.first) {
+      en.first = s;
+    }
+    if (e > en.last) {
+      en.last = e;
+    }
+    if (en.prev_end > 0 && s > en.prev_end) {
+      en.gaps += s - en.prev_end;
+    }
+    if (e > en.prev_end) {
+      en.prev_end = e;
+    }
+    if (g_cb_trace_enabled) {
+      if (g_cb_trace == nullptr) {
+        g_cb_trace = new std::vector<CbTraceEntry>();
+      }
+      g_cb_trace->push_back({key, s, e});
+    }
+  });
+}
+} // namespace
+
 MTL::CommandBuffer* Device::get_command_buffer(int index) {
   auto& stream = get_stream_(index);
   if (stream.buffer == nullptr) {
@@ -497,6 +620,9 @@ void Device::commit_command_buffer(int index) {
     // buffer would otherwise repeat from zero.
     v.clear();
     v.reserve(retained_count);
+  }
+  if (cb_profile_enabled()) {
+    cb_profile_attach(stream.buffer);
   }
   stream.buffer->commit();
   stream.buffer->release();
