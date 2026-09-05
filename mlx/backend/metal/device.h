@@ -236,7 +236,9 @@ class MLX_API Device {
   MTL::Library* get_library_cache_(const std::string& name);
 
   MTL::Library* get_library_(const std::string& name);
-  MTL::Library* build_library_(const std::string& source_string);
+  MTL::Library* build_library_(
+      const std::string& source_string,
+      bool fast_math = false);
 
   MTL::Function* get_function_(const std::string& name, MTL::Library* mtl_lib);
 

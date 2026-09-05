@@ -616,7 +616,9 @@ MTL::Library* Device::get_library(
   return new_lib;
 }
 
-MTL::Library* Device::build_library_(const std::string& source_string) {
+MTL::Library* Device::build_library_(
+    const std::string& source_string,
+    bool fast_math) {
   auto pool = new_scoped_memory_pool();
 
   auto ns_code =
@@ -624,7 +626,7 @@ MTL::Library* Device::build_library_(const std::string& source_string) {
 
   NS::Error* error = nullptr;
   auto options = MTL::CompileOptions::alloc()->init();
-  options->setFastMathEnabled(false);
+  options->setFastMathEnabled(fast_math);
   options->setLanguageVersion(get_metal_version());
 #ifndef NDEBUG
   if (options->languageVersion() >= MTL::LanguageVersion3_2) {
@@ -782,7 +784,12 @@ MTL::Library* Device::get_library(
     return it->second;
   }
 
-  auto mtl_lib = build_library_(builder());
+  // Tesseract: custom kernels named "fastmath_..." compile the way the
+  // package's AOT metallib does (Xcode's MTL_FAST_MATH=YES), so a JIT replica
+  // of an AOT kernel can match it bit for bit. Everything else keeps MLX's
+  // fast-math-off JIT default.
+  const bool fast_math = name.rfind("custom_kernel_fastmath_", 0) == 0;
+  auto mtl_lib = build_library_(builder(), fast_math);
   library_map_.insert({name, mtl_lib});
   return mtl_lib;
 }
