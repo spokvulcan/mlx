@@ -4,9 +4,39 @@
 #include "mlx/backend/metal/kernels.h"
 #include "mlx/backend/metal/utils.h"
 
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+
 using namespace fmt::literals;
 
 namespace mlx::core {
+
+namespace {
+
+// Kernel dev loop: MLX_QUANTIZED_KERNEL_FILE names a quantized.h whose text
+// replaces the built-in affine quantized kernel source, so an edited kernel
+// runs without rebuilding the library. Read once per process.
+const std::string& quantized_source_override() {
+  static const std::string source = []() {
+    const char* path = std::getenv("MLX_QUANTIZED_KERNEL_FILE");
+    if (path == nullptr || path[0] == '\0') {
+      return std::string();
+    }
+    std::ifstream file(path);
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+  }();
+  return source;
+}
+
+const char* affine_quantized_source() {
+  const auto& override = quantized_source_override();
+  return override.empty() ? metal::quantized() : override.c_str();
+}
+
+} // namespace
 
 MTL::ComputePipelineState* get_arange_kernel(
     metal::Device& d,
@@ -858,7 +888,7 @@ MTL::ComputePipelineState* get_quantized_kernel(
         metal::utils(),
         metal::gemm(),
         metal::quantized_utils(),
-        (mode == "affine") ? metal::quantized() : metal::fp_quantized(),
+        (mode == "affine") ? affine_quantized_source() : metal::fp_quantized(),
         template_def);
     return kernel_source;
   });

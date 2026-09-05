@@ -2880,8 +2880,9 @@ template <typename T, int group_size, int bits>
 // >= M clamp onto row M-1 and their results are never stored. Same dispatch
 // window as affine_qmm_mma8 (gated behind MLX_QMM_MMA8_N16 for A/B). fp32
 // accumulation, split-K over 8 simdgroups — the accumulation order per
-// output matches affine_qmm_mma8's.
-template <typename T, int group_size, int bits>
+// output matches affine_qmm_mma8's. `full_tiles` (host: N % 16 == 0) drops
+// the per-column range guards on the weight/scale loads.
+template <typename T, int group_size, int bits, bool full_tiles>
 [[kernel]] void affine_qmm_mma8n16(
     const device uint32_t* w [[buffer(0)]],
     const device T* scales [[buffer(1)]],
@@ -2928,18 +2929,14 @@ template <typename T, int group_size, int bits>
   const bool bValid = nA + 1 < N;
   const bool cValid = nC < N;
   const bool dValid = nC + 1 < N;
+  // One packed-weight pointer and one scale/bias pair per lane; the other
+  // three columns index off them (row strides kw and kg), and the
+  // activation word loads sit inside the kt loop. Same arithmetic as the
+  // twelve-pointer form, ~3% less time per launch: the tile is bound by
+  // its live registers (see the 2026-09-05 tile study).
   const device uint32_t* wa = w + (size_t)nA * kw;
-  const device uint32_t* wb = wa + kw;
-  const device uint32_t* wc = w + (size_t)nC * kw;
-  const device uint32_t* wd = wc + kw;
   const device T* sa = scales + (size_t)nA * kg;
-  const device T* sb = sa + kg;
-  const device T* sc = scales + (size_t)nC * kg;
-  const device T* sd = sc + kg;
   const device T* ba = biases + (size_t)nA * kg;
-  const device T* bb = ba + kg;
-  const device T* bc = biases + (size_t)nC * kg;
-  const device T* bd = bc + kg;
   const uint sh = (uint)(fragRow * bits);
 
   for (int kk = 0; kk < KPS; kk += 64) {
@@ -2948,37 +2945,42 @@ template <typename T, int group_size, int bits>
     const int woff = ka / pack; // 64 values = 8 uint32 at 4-bit
     uint32_t pa[8] = {0}, pb[8] = {0}, pc[8] = {0}, pd[8] = {0}, ax[8];
     float s0 = 0, b0 = 0, s1 = 0, b1 = 0, s2 = 0, b2 = 0, s3 = 0, b3 = 0;
-    if (aValid) {
-      s0 = (float)sa[g];
-      b0 = (float)ba[g];
-      *(thread uint4*)(pa) = *((const device uint4*)(wa + woff));
-      *(thread uint4*)(pa + 4) = *((const device uint4*)(wa + woff) + 1);
-    }
-    if (bValid) {
-      s1 = (float)sb[g];
-      b1 = (float)bb[g];
-      *(thread uint4*)(pb) = *((const device uint4*)(wb + woff));
-      *(thread uint4*)(pb + 4) = *((const device uint4*)(wb + woff) + 1);
-    }
-    if (cValid) {
-      s2 = (float)sc[g];
-      b2 = (float)bc[g];
-      *(thread uint4*)(pc) = *((const device uint4*)(wc + woff));
-      *(thread uint4*)(pc + 4) = *((const device uint4*)(wc + woff) + 1);
-    }
-    if (dValid) {
-      s3 = (float)sd[g];
-      b3 = (float)bd[g];
-      *(thread uint4*)(pd) = *((const device uint4*)(wd + woff));
-      *(thread uint4*)(pd + 4) = *((const device uint4*)(wd + woff) + 1);
-    }
-#pragma unroll
-    for (int kt = 0; kt < 8; ++kt) {
-      ax[kt] = *(const device uint32_t*)(arow + ka + kt * 8 + acol);
+    {
+      const device uint4* wq = (const device uint4*)(wa + woff);
+      const int kw4 = kw / 4;
+      // full_tiles: the host proved N % 16 == 0, so every column of the
+      // tile is in range and the four guards below compile out. The
+      // predicated load sequence costs ~8% of the kernel's time (the tile
+      // is register-bound; the 2026-09-05 tile study).
+      if (full_tiles || aValid) {
+        s0 = (float)sa[g];
+        b0 = (float)ba[g];
+        *(thread uint4*)(pa) = wq[0];
+        *(thread uint4*)(pa + 4) = wq[1];
+      }
+      if (full_tiles || bValid) {
+        s1 = (float)sa[kg + g];
+        b1 = (float)ba[kg + g];
+        *(thread uint4*)(pb) = wq[kw4];
+        *(thread uint4*)(pb + 4) = wq[kw4 + 1];
+      }
+      if (full_tiles || cValid) {
+        s2 = (float)sa[8 * kg + g];
+        b2 = (float)ba[8 * kg + g];
+        *(thread uint4*)(pc) = wq[8 * kw4];
+        *(thread uint4*)(pc + 4) = wq[8 * kw4 + 1];
+      }
+      if (full_tiles || dValid) {
+        s3 = (float)sa[9 * kg + g];
+        b3 = (float)ba[9 * kg + g];
+        *(thread uint4*)(pd) = wq[9 * kw4];
+        *(thread uint4*)(pd + 4) = wq[9 * kw4 + 1];
+      }
     }
     simdgroup_matrix<T, 8, 8> A, B0, B1;
 #pragma unroll
     for (int kt = 0; kt < 8; ++kt) {
+      ax[kt] = *(const device uint32_t*)(arow + ka + kt * 8 + acol);
       A.thread_elements()[0] = as_type<T>((ushort)(ax[kt] & 0xffffu));
       A.thread_elements()[1] = as_type<T>((ushort)(ax[kt] >> 16));
       B0.thread_elements()[0] = (T)((float)((pa[kt] >> sh) & qmask) * s0 + b0);
@@ -2998,6 +3000,174 @@ template <typename T, int group_size, int bits>
   // first 64 slots per simdgroup, n0+8..n0+15 from the second).
   for (int i = (int)tid; i < 128; i += 256) {
     const int t = i >> 6; // n tile
+    const int m = (i & 63) >> 3;
+    const int j = (i & 7) + (t << 3);
+    const int n = n0 + j;
+    if (m < M && n < N) {
+      float v = 0.0f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) {
+        v += red[q * 128 + i];
+      }
+      y[(size_t)m * N + n] = (T)v;
+    }
+  }
+}
+
+// The 128 + q bit trick for the v2 tile: OR a 4-bit nibble into the low
+// mantissa bits of 128.0 and the value is 128 + q * unit exactly (unit is 1
+// for bfloat16's 7-bit mantissa, 1/8 for half's 10-bit mantissa).
+template <typename T>
+struct qmm_v2_base;
+template <>
+struct qmm_v2_base<bfloat16_t> {
+  static constant constexpr const ushort bits = 0x4300;
+  static constant constexpr const float inv_unit = 1.0f;
+};
+template <>
+struct qmm_v2_base<half> {
+  static constant constexpr const ushort bits = 0x5800;
+  static constant constexpr const float inv_unit = 8.0f;
+};
+
+// v2 of affine_qmm_mma8n16: scale after accumulate. The MMA multiplies the
+// activations by the raw nibbles (as 128 + q via the mantissa trick, one
+// bit-op per weight instead of a dequant chain plus a bf16 round) into a
+// per-group f32 partial G, and the group's scale/bias fold in once per
+// group per output: C += s' * G + (b - 128 s') * rowsum(A), with s' = s /
+// unit. Each lane's C fragment elements sit in the very columns whose
+// scale/bias it already streams, and rowsum(A) over the group is two lane
+// shuffles. The dequantized weight is never rounded to T, so the result is
+// closer to the qmv kernels' f32 dequant than affine_qmm_mma8n16's.
+// `prefetch` double-buffers the next group's packed weights across the MMA
+// step (latency-bound family). Same dispatch window as affine_qmm_mma8n16.
+template <typename T, int group_size, int bits, bool prefetch>
+[[kernel]] void affine_qmm_mma8n16v2(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  static_assert(
+      group_size == 64, "affine_qmm_mma8n16v2 stages one quantization group");
+  static_assert(bits == 4, "affine_qmm_mma8n16v2 is 4-bit only");
+  constexpr int pack = 32 / bits;
+  constexpr ushort qbase = qmm_v2_base<T>::bits;
+  constexpr float inv_unit = qmm_v2_base<T>::inv_unit;
+
+  const int KPS = K / 8;
+  const uint sg = tid >> 5;
+  const uint lane = tid & 31;
+  const int n0 = (int)tgid.x * 16;
+
+  threadgroup float red[8 * 128];
+
+  const int kg = K / group_size;
+  const int kw = K / pack;
+
+  const int qid = (int)(lane >> 2);
+  const int fragRow = (qid & 4) + (int)((lane >> 1) & 3);
+  const int am = min(fragRow, M - 1);
+  const int acol = ((qid & 2) << 1) + ((int)(lane & 1) << 1);
+  const device T* arow = x + (size_t)am * K;
+
+  const int kbeg = (int)sg * KPS;
+
+  // One packed-weight pointer and one scale/bias pair per lane (the other
+  // three columns index off them), no per-column range guards — the host
+  // dispatches v2 only for N % 16 == 0 — and the activation words load in
+  // the kt loop: the same diet as affine_qmm_mma8n16, -6% per launch over
+  // the twelve-pointer guarded form (2026-09-05 tile study). `prefetch`
+  // is kept for the kernel names only; every load-ahead form lost.
+  const int nA = n0 + acol;
+  const device uint32_t* wa = w + (size_t)nA * kw;
+  const device T* sa = scales + (size_t)nA * kg;
+  const device T* ba = biases + (size_t)nA * kg;
+  const uint sh = (uint)(fragRow * bits);
+  const int kw4 = kw / 4;
+  // This lane's four outputs: row fragRow, columns nA, nA+1, nC, nC+1.
+  float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
+
+  for (int kk = 0; kk < KPS; kk += 64) {
+    const int ka = kbeg + kk;
+    const int g = ka >> 6;
+    const int woff = ka / pack;
+    uint32_t pa[8], pb[8], pc[8], pd[8];
+    {
+      const device uint4* wq = (const device uint4*)(wa + woff);
+      *(thread uint4*)(pa) = wq[0];
+      *(thread uint4*)(pa + 4) = wq[1];
+      *(thread uint4*)(pb) = wq[kw4];
+      *(thread uint4*)(pb + 4) = wq[kw4 + 1];
+      *(thread uint4*)(pc) = wq[8 * kw4];
+      *(thread uint4*)(pc + 4) = wq[8 * kw4 + 1];
+      *(thread uint4*)(pd) = wq[9 * kw4];
+      *(thread uint4*)(pd + 4) = wq[9 * kw4 + 1];
+    }
+    const float s0 = (float)sa[g];
+    const float b0 = (float)ba[g];
+    const float s1 = (float)sa[kg + g];
+    const float b1 = (float)ba[kg + g];
+    const float s2 = (float)sa[8 * kg + g];
+    const float b2 = (float)ba[8 * kg + g];
+    const float s3 = (float)sa[9 * kg + g];
+    const float b3 = (float)ba[9 * kg + g];
+
+    simdgroup_matrix<float, 8, 8> G0(0);
+    simdgroup_matrix<float, 8, 8> G1(0);
+    float rs = 0.0f;
+    simdgroup_matrix<T, 8, 8> A, B0, B1;
+#pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+      const uint32_t ax = *(const device uint32_t*)(arow + ka + kt * 8 + acol);
+      const T a0 = as_type<T>((ushort)(ax & 0xffffu));
+      const T a1 = as_type<T>((ushort)(ax >> 16));
+      A.thread_elements()[0] = a0;
+      A.thread_elements()[1] = a1;
+      rs += (float)a0 + (float)a1;
+      B0.thread_elements()[0] =
+          as_type<T>((ushort)(qbase | ((pa[kt] >> sh) & 0xfu)));
+      B0.thread_elements()[1] =
+          as_type<T>((ushort)(qbase | ((pb[kt] >> sh) & 0xfu)));
+      B1.thread_elements()[0] =
+          as_type<T>((ushort)(qbase | ((pc[kt] >> sh) & 0xfu)));
+      B1.thread_elements()[1] =
+          as_type<T>((ushort)(qbase | ((pd[kt] >> sh) & 0xfu)));
+      simdgroup_multiply_accumulate(G0, A, B0, G0);
+      simdgroup_multiply_accumulate(G1, A, B1, G1);
+    }
+    rs += simd_shuffle_xor(rs, (ushort)1);
+    rs += simd_shuffle_xor(rs, (ushort)8);
+
+    const float k0 = s0 * inv_unit;
+    const float k1 = s1 * inv_unit;
+    const float k2 = s2 * inv_unit;
+    const float k3 = s3 * inv_unit;
+    c00 += k0 * G0.thread_elements()[0] + (b0 - 128.0f * k0) * rs;
+    c01 += k1 * G0.thread_elements()[1] + (b1 - 128.0f * k1) * rs;
+    c10 += k2 * G1.thread_elements()[0] + (b2 - 128.0f * k2) * rs;
+    c11 += k3 * G1.thread_elements()[1] + (b3 - 128.0f * k3) * rs;
+  }
+#undef QMM_V2_LOAD
+
+  // Stage this lane's C elements at their fragment positions, then sum the
+  // 8 split-K partials exactly like affine_qmm_mma8n16.
+  {
+    threadgroup float* r = red + sg * 128 + fragRow * 8 + acol;
+    r[0] = c00;
+    r[1] = c01;
+    r[64] = c10;
+    r[65] = c11;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  for (int i = (int)tid; i < 128; i += 256) {
+    const int t = i >> 6;
     const int m = (i & 63) >> 3;
     const int j = (i & 7) + (t << 3);
     const int n = n0 + j;

@@ -1,3 +1,4 @@
+#include <set>
 // Copyright © 2023-2024 Apple Inc.
 
 #include "mlx/backend/common/broadcasting.h"
@@ -1422,25 +1423,100 @@ void qmm_mma8(
     const char* v = getenv("MLX_QMM_MMA8_N32");
     return v != nullptr && v[0] == '1';
   }();
-  const bool n32 = bits == 4 && n32_enabled;
-  const bool n16 = !n32 && bits == 4 && qmm_mma8_n16_enabled();
+  // The scale-after-accumulate 16-wide tile (affine_qmm_mma8n16v2) is the
+  // default 4-bit route for full 16-column tiles: B carries 128 + q exactly
+  // and each group's raw products accumulate in fp32 before the per-column
+  // scale and bias — one extract per element instead of the four-op
+  // dequant chain, -6% per launch, generated streams identical on the
+  // DFlash2 fixtures (2026-09-05). MLX_QMM_MMA8_V2=0 is the kill-switch
+  // back to the per-element tile; 2 keeps the old prefetch kernel name.
+  static const int v2_mode = []() {
+    const char* v = getenv("MLX_QMM_MMA8_V2");
+    return v ? atoi(v) : 1;
+  }();
+  // v2 runs without per-column range guards: full 16-column tiles only.
+  const bool v2 = bits == 4 && v2_mode > 0 && (N % 16) == 0;
+  const bool n32 = !v2 && bits == 4 && n32_enabled;
+  const bool n16 = !v2 && !n32 && bits == 4 && qmm_mma8_n16_enabled();
   std::string kname;
   kname.reserve(64);
   std::string type_string = get_type_string(x.dtype());
-  const char* base = n32
-      ? "affine_qmm_mma8n32_"
-      : (n16 ? "affine_qmm_mma8n16_" : "affine_qmm_mma8_");
-  concatenate(
-      kname, base, type_string, "_gs_", group_size, "_b_", bits);
-  auto kernel = get_quantized_kernel_wrapped(
-      d,
-      kname,
-      n32 ? "qmm_mma8n32" : (n16 ? "qmm_mma8n16" : "qmm_mma8"),
-      "affine",
-      type_string,
-      group_size,
-      bits);
+  MTL::ComputePipelineState* kernel = nullptr;
+  if (v2) {
+    const bool pf = v2_mode >= 2;
+    concatenate(
+        kname,
+        "affine_qmm_mma8n16v2_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        pf ? "_pf_1" : "_pf_0");
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmm_mma8n16v2",
+        "affine",
+        type_string,
+        group_size,
+        bits,
+        pf ? "true" : "false");
+  } else if (n16) {
+    // Every 16-column tile is full when N % 16 == 0 (all of this model's
+    // shapes): the branchless variant skips the per-column range guards.
+    const bool full_tiles = (N % 16) == 0;
+    concatenate(
+        kname,
+        "affine_qmm_mma8n16_",
+        type_string,
+        "_gs_",
+        group_size,
+        "_b_",
+        bits,
+        full_tiles ? "_ft_1" : "_ft_0");
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        "qmm_mma8n16",
+        "affine",
+        type_string,
+        group_size,
+        bits,
+        full_tiles ? "true" : "false");
+  } else {
+    const char* base = n32 ? "affine_qmm_mma8n32_" : "affine_qmm_mma8_";
+    concatenate(
+        kname, base, type_string, "_gs_", group_size, "_b_", bits);
+    kernel = get_quantized_kernel_wrapped(
+        d,
+        kname,
+        n32 ? "qmm_mma8n32" : "qmm_mma8",
+        "affine",
+        type_string,
+        group_size,
+        bits);
+  }
 
+  // MLX_QMM_DEBUG=1: print each mma8 pipeline's occupancy limits once
+  // (maxTotalThreadsPerThreadgroup drops below 1024 when the register
+  // footprint limits residency).
+  static const bool qmm_debug = []() {
+    const char* v = getenv("MLX_QMM_DEBUG");
+    return v != nullptr && v[0] == '1';
+  }();
+  if (qmm_debug) {
+    static std::set<std::string> printed;
+    if (printed.insert(kname).second) {
+      fprintf(
+          stderr,
+          "[qmm-debug] %s maxThreadsPerTG=%lu simdWidth=%lu staticTGMem=%lu\n",
+          kname.c_str(),
+          (unsigned long)kernel->maxTotalThreadsPerThreadgroup(),
+          (unsigned long)kernel->threadExecutionWidth(),
+          (unsigned long)kernel->staticThreadgroupMemoryLength());
+    }
+  }
   auto& compute_encoder = d.get_command_encoder(s.index);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -1456,7 +1532,9 @@ void qmm_mma8(
 
   MTL::Size group_dims(256, 1, 1);
   MTL::Size grid_dims(
-      n32 ? (N + 31) / 32 : (n16 ? (N + 15) / 16 : (N + 7) / 8), 1, 1);
+      n32 ? (N + 31) / 32 : ((n16 || v2) ? (N + 15) / 16 : (N + 7) / 8),
+      1,
+      1);
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 

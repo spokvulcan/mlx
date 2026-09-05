@@ -150,6 +150,14 @@
 #define instantiate_quantized_all_mma8n32(type) \
   instantiate_quantized(affine_qmm_mma8n32, type, 64, 4)
 
+#define instantiate_quantized_all_mma8n16v2(type)                          \
+  instantiate_kernel(                                                      \
+      "affine_qmm_mma8n16v2_" #type "_gs_64_b_4_pf_0",                     \
+      affine_qmm_mma8n16v2, type, 64, 4, false)                            \
+  instantiate_kernel(                                                      \
+      "affine_qmm_mma8n16v2_" #type "_gs_64_b_4_pf_1",                     \
+      affine_qmm_mma8n16v2, type, 64, 4, true)
+
 #define instantiate_quantized_all_splitk(type, group_size, bits)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 8)   \
   instantiate_quantized_split_k(affine_qvm_split_k, type, group_size, bits, 32)
@@ -195,5 +203,7 @@ instantiate_quantized_all_mma8n16(float16_t)
 instantiate_quantized_all_mma8n16(bfloat16_t)
 instantiate_quantized_all_mma8n32(float16_t)
 instantiate_quantized_all_mma8n32(bfloat16_t)
+instantiate_quantized_all_mma8n16v2(float16_t)
+instantiate_quantized_all_mma8n16v2(bfloat16_t)
 
 instantiate_quantized_all() // clang-format on
