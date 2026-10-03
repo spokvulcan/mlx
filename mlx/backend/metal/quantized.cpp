@@ -1,4 +1,6 @@
 #include <set>
+#include <shared_mutex>
+#include <unordered_map>
 // Copyright © 2023-2024 Apple Inc.
 
 #include "mlx/backend/common/broadcasting.h"
@@ -27,11 +29,25 @@ auto get_quantized_kernel_wrapped(
     int group_size,
     int bits,
     Args... args) {
+  // Tesseract: the kernel name already identifies the library (it is the
+  // library's cache key), so a known name skips formatting the template
+  // definition on every dispatch.
+  static std::shared_mutex memo_mtx;
+  static std::unordered_map<std::string, MTL::ComputePipelineState*> memo;
+  {
+    std::shared_lock lock(memo_mtx);
+    if (auto it = memo.find(name); it != memo.end()) {
+      return it->second;
+    }
+  }
   std::string template_def;
   std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
   template_def = get_template_definition(
       name, fname, type, group_size, bits, std::forward<Args>(args)...);
-  return get_quantized_kernel(d, name, template_def, mode);
+  auto kernel = get_quantized_kernel(d, name, template_def, mode);
+  std::unique_lock lock(memo_mtx);
+  memo.emplace(name, kernel);
+  return kernel;
 }
 
 template <typename... Args>

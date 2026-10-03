@@ -376,7 +376,8 @@ class CustomKernel : public Primitive {
       std::vector<ScalarArg> scalar_arguments,
       bool is_precompiled,
       int shared_memory,
-      std::vector<int> inplace_inputs = {})
+      std::vector<int> inplace_inputs = {},
+      std::shared_ptr<const std::string> source_token = nullptr)
       : Primitive(stream),
         name_(std::move(name)),
         source_(std::move(source)),
@@ -388,7 +389,8 @@ class CustomKernel : public Primitive {
         scalar_arguments_(std::move(scalar_arguments)),
         is_precompiled_(is_precompiled),
         shared_memory_(shared_memory),
-        inplace_inputs_(std::move(inplace_inputs)) {}
+        inplace_inputs_(std::move(inplace_inputs)),
+        source_token_(std::move(source_token)) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -427,6 +429,9 @@ class CustomKernel : public Primitive {
   int shared_memory_;
   // Per output: the input whose buffer it updates in place, or -1.
   std::vector<int> inplace_inputs_;
+  // The call site's shared copy of source_, an identity for the library
+  // cache check (null when built elsewhere).
+  std::shared_ptr<const std::string> source_token_;
 };
 
 } // namespace mlx::core::fast
