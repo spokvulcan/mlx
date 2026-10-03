@@ -1,5 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
+#include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <regex>
@@ -192,6 +194,25 @@ CustomKernelFunction metal_kernel(
     throw std::invalid_argument(
         "[metal_kernel] Must specify at least one output.");
   }
+  // Tesseract: an output named `inplace_<input>` updates that input's buffer
+  // in place; the kernel writes only the elements it changes.
+  std::vector<int> inplace_inputs(output_names.size(), -1);
+  for (int i = 0; i < output_names.size(); ++i) {
+    const std::string prefix = "inplace_";
+    const auto& out_name = output_names[i];
+    if (out_name.rfind(prefix, 0) != 0) {
+      continue;
+    }
+    auto it = std::find(
+        input_names.begin(),
+        input_names.end(),
+        out_name.substr(prefix.size()));
+    if (it == input_names.end()) {
+      throw std::invalid_argument(
+          "[metal_kernel] In-place output " + out_name + " names no input.");
+    }
+    inplace_inputs[i] = it - input_names.begin();
+  }
   std::vector<std::tuple<bool, bool, bool>> shape_infos;
   for (auto& n : input_names) {
     std::tuple<bool, bool, bool> shape_info;
@@ -231,6 +252,7 @@ CustomKernelFunction metal_kernel(
   }
 
   return [=,
+          inplace_inputs = std::move(inplace_inputs),
           shape_infos = std::move(shape_infos),
           attributes = std::move(attributes),
           sig_cache = std::make_shared<CustomKernelSignatureCache>(),
@@ -270,6 +292,17 @@ CustomKernelFunction metal_kernel(
     auto s = to_stream(s_);
     if (s.device != Device::gpu) {
       throw std::invalid_argument("[metal_kernel] Only supports the GPU.");
+    }
+    for (int i = 0; i < inplace_inputs.size(); ++i) {
+      if (inplace_inputs[i] < 0) {
+        continue;
+      }
+      const auto& src = inputs[inplace_inputs[i]];
+      if (src.shape() != output_shapes[i] || src.dtype() != output_dtypes[i]) {
+        throw std::invalid_argument(
+            "[metal_kernel] In-place output " + output_names[i] +
+            " must match its input's shape and dtype.");
+      }
     }
 
     // Memoize the generated (kernel_name, kernel_source): for a given call
@@ -382,9 +415,21 @@ CustomKernelFunction metal_kernel(
             init_value,
             std::vector<ScalarArg>{},
             false,
-            0),
+            0,
+            inplace_inputs),
         std::move(inputs));
   };
+}
+
+// The in-place rule of MLX_DYNSLICE_INPLACE (see DynamicSliceUpdate): with
+// the flag set an in-place output aliases its input's buffer even when other
+// arrays still hold it; the caller guarantees no reader sees the change.
+static bool inplace_aliasing_enabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("MLX_DYNSLICE_INPLACE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return enabled;
 }
 
 void CustomKernel::eval_gpu(
@@ -398,7 +443,24 @@ void CustomKernel::eval_gpu(
 
   std::vector<array> copies;
 
-  for (auto& out : outputs) {
+  for (int i = 0; i < outputs.size(); ++i) {
+    auto& out = outputs[i];
+    int src_index = i < inplace_inputs_.size() ? inplace_inputs_[i] : -1;
+    if (src_index >= 0) {
+      const array& src = inputs[src_index];
+      if (inplace_aliasing_enabled() && src.flags().row_contiguous &&
+          src.size() == src.data_size()) {
+        out.copy_shared_buffer(src);
+      } else {
+        // Donates the buffer when nothing else holds it, else copies it.
+        copy_gpu(
+            src,
+            out,
+            src.flags().row_contiguous ? CopyType::Vector : CopyType::General,
+            s);
+      }
+      continue;
+    }
     if (init_value_) {
       copies.emplace_back(init_value_.value(), out.dtype());
       fill_gpu(copies.back(), out, s);
