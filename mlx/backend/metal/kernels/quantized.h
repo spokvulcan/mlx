@@ -1920,6 +1920,140 @@ template <
       w, scales, biases, x, y, Xs, Ws, K, N, M, tid, lid, simd_gid, simd_lid);
 }
 
+// Large-M affine QMM (prefill): a 128 x 32 output tile per threadgroup, four
+// simdgroups stacked along M that share one dequantized 32-column weight
+// tile, so each dequantized weight serves 128 rows instead of qmm_t's 32.
+// Every 8x8 output fragment runs the same f32 MMAs in the same k order on the
+// same values as affine_qmm_t (x converted from T, the weight dequantized to T
+// by the same expression, f32 accumulation, one rounding to T), so the output
+// is bitwise identical to it. No two simdgroups share x rows, so x fragments
+// load straight from device memory; the weight tile is double-buffered.
+// Rows past M clamp onto row M - 1 and are never stored. Non-batched,
+// transposed, N % 32 == 0, K % 64 == 0.
+template <typename T, int group_size, int bits>
+[[kernel]] void affine_qmm_t_tall(
+    const device uint32_t* w [[buffer(0)]],
+    const device T* scales [[buffer(1)]],
+    const device T* biases [[buffer(2)]],
+    const device T* x [[buffer(3)]],
+    device T* y [[buffer(4)]],
+    const constant int& K [[buffer(5)]],
+    const constant int& N [[buffer(6)]],
+    const constant int& M [[buffer(7)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(bits == 4, "affine_qmm_t_tall dequantizes 4-bit packs");
+  static_assert(group_size % 32 == 0, "a 32-wide k step stays in one group");
+  constexpr int BM = 128;
+  constexpr int BN = 32;
+  constexpr int BK = 32;
+  constexpr int TM = BM / 32; // 8-row fragments per simdgroup
+  constexpr int TN = BN / 8;
+  constexpr int LD = BK + 16 / sizeof(T);
+  constexpr int words_per_step = BN * BK / 8; // one per thread
+  static_assert(words_per_step == 128, "one weight word per thread per step");
+
+  threadgroup T Ws[2 * BN * LD];
+
+  const int K_w = K / 8;
+  const int K_g = K / group_size;
+  const int row0 = tid.y * BM;
+  const int col0 = tid.x * BN;
+
+  // This lane's fragment coordinates (BaseMMAFrag::get_coord).
+  const short qid = simd_lid / 4;
+  const short fm = (qid & 4) + ((simd_lid / 2) % 4);
+  const short fn = (qid & 2) * 2 + (simd_lid % 2) * 2;
+  const int sg_m = simd_gid * TM * 8;
+
+  const device T* xr[TM];
+  MLX_MTL_PRAGMA_UNROLL
+  for (int i = 0; i < TM; i++) {
+    xr[i] = x + int64_t(min(row0 + sg_m + 8 * i + fm, M - 1)) * K + fn;
+  }
+
+  // The thread's weight word: row r of the tile, word wc of the k step.
+  const int r = lid / (BK / 8);
+  const int wc = lid % (BK / 8);
+  const device uint32_t* wrow = w + int64_t(col0 + r) * K_w + wc;
+  const device T* srow = scales + int64_t(col0 + r) * K_g;
+  const device T* brow = biases + int64_t(col0 + r) * K_g;
+
+  auto load_w = [&](int k0, threadgroup T* stage) {
+    uint32_t word = wrow[k0 / 8];
+    T scale = srow[k0 / group_size];
+    T bias = brow[k0 / group_size];
+    T s[2] = {scale, scale / static_cast<T>(16.0f)};
+    T vals[8];
+    MLX_MTL_PRAGMA_UNROLL
+    for (int b = 0; b < 4; b++) {
+      uint8_t byte = (word >> (8 * b)) & 0xff;
+      vals[2 * b] = s[0] * (byte & 0x0f) + bias;
+      vals[2 * b + 1] = s[1] * (byte & 0xf0) + bias;
+    }
+    *(threadgroup uint4*)(stage + r * LD + wc * 8) = *(thread uint4*)vals;
+  };
+
+  simdgroup_matrix<float, 8, 8> C[TM][TN];
+  MLX_MTL_PRAGMA_UNROLL
+  for (int i = 0; i < TM; i++) {
+    MLX_MTL_PRAGMA_UNROLL
+    for (int j = 0; j < TN; j++) {
+      C[i][j] = simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+  }
+
+  int stage = 0;
+  load_w(0, Ws);
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup const T* Wcur = Ws + stage * BN * LD;
+    if (k0 + BK < K) {
+      load_w(k0 + BK, Ws + (1 - stage) * BN * LD);
+    }
+    MLX_MTL_PRAGMA_UNROLL
+    for (int kk = 0; kk < BK; kk += 8) {
+      simdgroup_matrix<float, 8, 8> A[TM];
+      simdgroup_matrix<float, 8, 8> B[TN];
+      MLX_MTL_PRAGMA_UNROLL
+      for (int i = 0; i < TM; i++) {
+        vec<T, 2> v = *(const device vec<T, 2>*)(xr[i] + k0 + kk);
+        A[i].thread_elements()[0] = static_cast<float>(v[0]);
+        A[i].thread_elements()[1] = static_cast<float>(v[1]);
+      }
+      MLX_MTL_PRAGMA_UNROLL
+      for (int j = 0; j < TN; j++) {
+        threadgroup const T* p = Wcur + (8 * j + fn) * LD + kk + fm;
+        B[j].thread_elements()[0] = static_cast<float>(p[0]);
+        B[j].thread_elements()[1] = static_cast<float>(p[LD]);
+      }
+      MLX_MTL_PRAGMA_UNROLL
+      for (int i = 0; i < TM; i++) {
+        MLX_MTL_PRAGMA_UNROLL
+        for (int j = 0; j < TN; j++) {
+          simdgroup_multiply_accumulate(C[i][j], A[i], B[j], C[i][j]);
+        }
+      }
+    }
+    stage = 1 - stage;
+  }
+
+  MLX_MTL_PRAGMA_UNROLL
+  for (int i = 0; i < TM; i++) {
+    const int row = row0 + sg_m + 8 * i + fm;
+    if (row < M) {
+      MLX_MTL_PRAGMA_UNROLL
+      for (int j = 0; j < TN; j++) {
+        device T* out = y + int64_t(row) * N + col0 + 8 * j + fn;
+        out[0] = static_cast<T>(C[i][j].thread_elements()[0]);
+        out[1] = static_cast<T>(C[i][j].thread_elements()[1]);
+      }
+    }
+  }
+}
+
 template <
     typename T,
     const int group_size,

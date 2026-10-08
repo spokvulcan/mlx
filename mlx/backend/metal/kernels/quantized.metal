@@ -147,6 +147,10 @@
 #define instantiate_quantized_all_mma8n16(type) \
   instantiate_quantized(affine_qmm_mma8n16, type, 64, 4)
 
+// Large-M 128 x 32 tile (bitwise with affine_qmm_t): affine gs64, 4-bit.
+#define instantiate_quantized_all_t_tall(type) \
+  instantiate_quantized(affine_qmm_t_tall, type, 64, 4)
+
 #define instantiate_quantized_all_mma8n32(type) \
   instantiate_quantized(affine_qmm_mma8n32, type, 64, 4)
 
@@ -201,6 +205,8 @@ instantiate_quantized_all_mma16(bfloat16_t)
 
 instantiate_quantized_all_mma8n16(float16_t)
 instantiate_quantized_all_mma8n16(bfloat16_t)
+instantiate_quantized_all_t_tall(float16_t)
+instantiate_quantized_all_t_tall(bfloat16_t)
 instantiate_quantized_all_mma8n32(float16_t)
 instantiate_quantized_all_mma8n32(bfloat16_t)
 instantiate_quantized_all_mma8n16v2(float16_t)

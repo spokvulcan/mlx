@@ -782,6 +782,67 @@ void gather_qmm_nax(
   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 
+// Large-M 4-bit route (affine_qmm_t_tall): a 128 x 32 tile whose output is
+// bitwise identical to affine_qmm_t's, with each dequantized weight reused
+// across 128 rows. MLX_QMM_TALL=0 keeps every M on qmm_t.
+inline bool use_qmm_t_tall(
+    const std::string& mode,
+    bool transpose,
+    int B,
+    int M,
+    int N,
+    int K,
+    int group_size,
+    int bits,
+    const array& x,
+    const std::optional<array>& biases) {
+  static const bool enabled = []() {
+    const char* v = getenv("MLX_QMM_TALL");
+    return v == nullptr || v[0] != '0';
+  }();
+  return enabled && transpose && mode == "affine" && biases.has_value() &&
+      B == 1 && bits == 4 && group_size == 64 && M >= 128 && N % 32 == 0 &&
+      K % 64 == 0 && (x.dtype() == bfloat16 || x.dtype() == float16);
+}
+
+void qmm_t_tall(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int group_size,
+    int bits,
+    int M,
+    int N,
+    int K,
+    metal::Device& d,
+    const Stream& s) {
+  std::string kname;
+  kname.reserve(64);
+  std::string type_string = get_type_string(x.dtype());
+  concatenate(
+      kname, "affine_qmm_t_tall_", type_string, "_gs_", group_size, "_b_", bits);
+  auto kernel = get_quantized_kernel_wrapped(
+      d, kname, "qmm_t_tall", "affine", type_string, group_size, bits);
+  auto& compute_encoder = d.get_command_encoder(s.index);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  int c = 0;
+  compute_encoder.set_input_array(w, c++);
+  compute_encoder.set_input_array(scales, c++);
+  compute_encoder.set_input_array(*biases, c++);
+  compute_encoder.set_input_array(x, c++);
+  compute_encoder.set_output_array(out, c++);
+  compute_encoder.set_bytes(K, c++);
+  compute_encoder.set_bytes(N, c++);
+  compute_encoder.set_bytes(M, c++);
+
+  MTL::Size group_dims(128, 1, 1);
+  MTL::Size grid_dims(N / 32, (M + 127) / 128, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
 void qmm(
     const array& x,
     const array& w,
@@ -817,6 +878,12 @@ void qmm(
   }
 
   int B = out.size() / M / N;
+
+  if (use_qmm_t_tall(
+          mode, transpose, B, M, N, K, group_size, bits, x, biases)) {
+    qmm_t_tall(x, w, scales, biases, out, group_size, bits, M, N, K, d, s);
+    return;
+  }
 
   int wm = 2;
   int wn = 2;
